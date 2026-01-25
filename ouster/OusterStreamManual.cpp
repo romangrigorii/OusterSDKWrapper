@@ -1,5 +1,5 @@
 #include "OusterStream.h"
-#include "../../engine/platform/Logger.h"
+#include "platform/Logger.h"
 #include <cmath>
 #include <cstdio>
 #include <vector>

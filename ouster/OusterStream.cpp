@@ -2,7 +2,7 @@
 #include "OusterStreamUtilities.h"
 #include "OusterStreamFileLoader.h"
 #include "OusterStreamLiveStreaming.h"
-#include "../../engine/platform/Logger.h"
+#include "platform/Logger.h"
 #include <cmath>
 #include <chrono>
 #include <iostream>

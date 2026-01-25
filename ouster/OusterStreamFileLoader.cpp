@@ -1,6 +1,6 @@
 #include "OusterStreamFileLoader.h"
 #include "OusterStream.h"
-#include "../../engine/platform/Logger.h"
+#include "platform/Logger.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>

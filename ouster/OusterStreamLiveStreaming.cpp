@@ -1,7 +1,7 @@
 #include "OusterStreamLiveStreaming.h"
 #include "OusterStream.h"
 #include "OusterStreamUtilities.h"
-#include "../../engine/platform/Logger.h"
+#include "platform/Logger.h"
 #include <thread>
 #include <chrono>
 #include <cstdlib>
@@ -889,6 +889,7 @@ void StreamingThreadImpl(OusterStream* stream) {
             LOG_ERROR("OusterLiveStreaming", "Nested exception of unknown type");
         }
         stream->m_streaming = false;
+#ifdef OUSTER_SDK_AVAILABLE
         if (stream->m_sdkScanSource) {
             stream->m_sdkScanSource.reset();
         }
@@ -898,9 +899,11 @@ void StreamingThreadImpl(OusterStream* stream) {
         if (stream->m_xyzlut_ptr) {
             stream->m_xyzlut_ptr.reset();
         }
+#endif
     } catch (...) {
         LOG_ERROR("OusterLiveStreaming", "Unknown exception in StreamingThread (not std::exception)");
         stream->m_streaming = false;
+#ifdef OUSTER_SDK_AVAILABLE
         if (stream->m_sdkScanSource) {
             stream->m_sdkScanSource.reset();
         }
@@ -910,6 +913,7 @@ void StreamingThreadImpl(OusterStream* stream) {
         if (stream->m_xyzlut_ptr) {
             stream->m_xyzlut_ptr.reset();
         }
+#endif
     }
 #else
     stream->m_streaming = false;
