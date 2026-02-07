@@ -1,0 +1,23 @@
+# Python virtual environments
+venv/
+**/venv/
+.venv/
+**/.venv/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+build/
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store

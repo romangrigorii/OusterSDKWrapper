@@ -19,6 +19,9 @@ namespace CameraSystem {
 
 #pragma pack(push, 1)
 
+// Column header for LEGACY UDP profile (16 bytes)
+// Note: Ouster v2.x firmware uses this with "header_type":"STANDARD" in metadata
+// but actual packet format still uses 16-byte column header
 struct LidarColumnHeader {
     uint64_t timestamp;
     uint16_t measurementId;
@@ -414,6 +417,7 @@ void ProcessLidarPacketFromFileManual(OusterStream* stream, const uint8_t* data,
 }
 
 // Manual packet processing for live streaming
+// Uses same proven logic as ProcessLidarPacketFromFileManual (PCAP loading)
 void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t size) {
     const size_t columnHeaderSize = sizeof(LidarColumnHeader);
     const size_t blockHdrSize = static_cast<size_t>(stream->m_measurementBlockHeaderSize);
@@ -421,8 +425,10 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
     const size_t columnDataSize = static_cast<size_t>(stream->m_beamCount) * pixelStride;
     const size_t columnSize = columnHeaderSize + blockHdrSize + columnDataSize;
     
+    // Use same beam angles as file loading
     std::vector<float> beamAltitudeAngles = stream->m_beamAltitudeAngles;
     std::vector<float> beamAzimuthAngles = stream->m_beamAzimuthAngles;
+    
     if (beamAltitudeAngles.empty() || beamAzimuthAngles.empty()) {
         beamAltitudeAngles.resize(stream->m_beamCount);
         beamAzimuthAngles.resize(stream->m_beamCount);
@@ -432,22 +438,16 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
         }
     }
     
-    static thread_local uint16_t currentFrameId = 0;
-    static thread_local bool frameStarted = false;
-    static thread_local uint64_t lastColumnTimestamp = 0;
-    static thread_local uint32_t minEncoder = 0, maxEncoder = 0;
-    static thread_local bool encoderInitialized = false;
-    
     size_t offset = 0;
-    int totalColumns = 0, skippedColumns = 0, totalPointsProcessed = 0;
+    int totalColumns = 0;
+    int skippedColumns = 0;
+    int totalPointsProcessed = 0;
     
-    while (offset + columnSize <= size) {
-        totalColumns++;
-        if (totalColumns > 2000) {
-            LOG_WARNING("OusterStream", "Too many columns, stopping parse");
-            break;
-        }
-        
+    if (size < columnSize) {
+        return;
+    }
+    
+    while (offset + columnSize <= size && totalColumns < stream->m_columnsPerPacket) {
         const uint8_t* colBase = data + offset;
         const LidarColumnHeader* header = reinterpret_cast<const LidarColumnHeader*>(colBase);
         
@@ -457,43 +457,60 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
             continue;
         }
         
+        totalColumns++;
+        
+        uint16_t measurementId = header->measurementId;
         uint32_t encoderCount = header->encoderCount % stream->m_encoderTicksPerRev;
         
-        if (!frameStarted || header->frameId != currentFrameId) {
-            if (frameStarted && !stream->m_currentFrame.empty()) {
-                stream->FlushCurrentFrame(lastColumnTimestamp, minEncoder, maxEncoder, encoderInitialized);
+        // Debug: Log first few column headers to verify structure
+        static int debugCount = 0;
+        if (debugCount < 50) {
+            LOG_INFO_FMT("OusterStream", "Col %d: ts=%llu measId=%u frameId=%u encoder=%u", 
+                        totalColumns, header->timestamp, header->measurementId, header->frameId, header->encoderCount);
+            debugCount++;
+        }
+        
+        // Use frameId for frame boundary detection (same as PCAP loading)
+        // This is proven to work correctly
+        if (!stream->m_fileLoadFrameStarted || header->frameId != stream->m_fileLoadFrameId) {
+            // New frame detected - flush previous frame to queue
+            if (stream->m_fileLoadFrameStarted && !stream->m_currentFrame.empty()) {
+                stream->FlushCurrentFrame(stream->m_fileLoadLastTimestamp, 
+                                         stream->m_fileLoadMinEncoder, 
+                                         stream->m_fileLoadMaxEncoder, 
+                                         stream->m_fileLoadEncoderInitialized);
             }
             
             stream->m_currentFrame.clear();
-            currentFrameId = header->frameId;
-            frameStarted = true;
-            lastColumnTimestamp = header->timestamp;
+            stream->m_fileLoadFrameId = header->frameId;
+            stream->m_fileLoadFrameStarted = true;
+            stream->m_fileLoadLastTimestamp = header->timestamp;
             stream->m_liveLastColumnTimestampNs.store(header->timestamp);
-            minEncoder = maxEncoder = encoderCount;
-            encoderInitialized = true;
-            if (totalColumns == 1) {
-                LOG_INFO_FMT("OusterStream", "Starting frame %d (first column, encoder: %u)", 
-                             currentFrameId, encoderCount);
-            }
+            stream->m_fileLoadMinEncoder = stream->m_fileLoadMaxEncoder = encoderCount;
+            stream->m_fileLoadEncoderInitialized = true;
         } else {
-            lastColumnTimestamp = header->timestamp;
+            stream->m_fileLoadLastTimestamp = header->timestamp;
             stream->m_liveLastColumnTimestampNs.store(header->timestamp);
             
-            if (encoderInitialized) {
-                minEncoder = std::min(minEncoder, encoderCount);
-                maxEncoder = std::max(maxEncoder, encoderCount);
+            if (stream->m_fileLoadEncoderInitialized) {
+                stream->m_fileLoadMinEncoder = std::min(stream->m_fileLoadMinEncoder, encoderCount);
+                stream->m_fileLoadMaxEncoder = std::max(stream->m_fileLoadMaxEncoder, encoderCount);
             } else {
-                minEncoder = maxEncoder = encoderCount;
-                encoderInitialized = true;
+                stream->m_fileLoadMinEncoder = stream->m_fileLoadMaxEncoder = encoderCount;
+                stream->m_fileLoadEncoderInitialized = true;
             }
         }
         
-        uint16_t measurementId = header->measurementId;
-        
+        // Process pixels (same as PCAP loading)
         const uint8_t* pxBase = colBase + columnHeaderSize + blockHdrSize;
+        const uint8_t* colEnd = colBase + columnSize;
         
         for (int beam = 0; beam < stream->m_beamCount; beam += stream->m_config.downsampleFactor) {
             const uint8_t* p = pxBase + beam * pixelStride;
+            
+            if (p + pixelStride > colEnd) {
+                break;
+            }
             
             uint32_t range_counts;
             uint16_t signal;
@@ -501,6 +518,7 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
             std::memcpy(&signal, p + 4, sizeof(uint16_t));
             
             float range = static_cast<float>(range_counts) * stream->m_rangeUnit;
+            
             if (range <= 0.0f || range < stream->m_config.minRange || range > stream->m_config.maxRange) {
                 continue;
             }
@@ -512,8 +530,13 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
         offset += columnSize;
     }
     
-    LOG_INFO_FMT("OusterStream", "Packet parsing stats: %d columns processed, %d skipped, %d total points extracted", 
-                 totalColumns, skippedColumns, totalPointsProcessed);
+    // Log stats periodically
+    static int packetCount = 0;
+    packetCount++;
+    if (packetCount <= 5 || packetCount % 100 == 0) {
+        LOG_INFO_FMT("OusterStream", "Packet %d: %d columns, %d points, frame %u (%zu pts accumulated)", 
+                     packetCount, totalColumns, totalPointsProcessed, stream->m_fileLoadFrameId, stream->m_currentFrame.size());
+    }
 }
 
 } // namespace CameraSystem

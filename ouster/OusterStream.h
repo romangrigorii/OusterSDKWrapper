@@ -10,6 +10,8 @@
 #include <thread>
 #include <mutex>
 #include <queue>
+#include <deque>
+#include <chrono>
 
 // Forward declarations for Ouster SDK types
 // These are always declared (even when SDK not available) to avoid compilation errors
@@ -54,8 +56,15 @@ namespace OusterLiveStreaming {
 
 // Ouster sensor configuration
 struct OusterConfig {
-    std::string hostname = "172.17.1.56";  // Your sensor's IP
-    int lidarPort = 7504;  // Changed from 7502 to avoid zombie socket
+    std::string hostname = "172.17.1.56";  // Ouster sensor IP
+    std::string localIp = "172.17.1.100";  // Local IP to bind to (on same network as sensor)
+    int lidarPort = 7510;  // Port sensor sends lidar data to
+    int imuPort = 7513;    // Port sensor sends IMU data to (use 7513 to avoid 7503 conflicts)
+    
+    // Use Python UDP bridge to bypass macOS firewall
+    // Required on macOS because unsigned C++ binaries can't receive UDP
+    bool useBridge = true;  // Enabled - Python receives UDP and forwards via Unix socket
+    int bridgePort = 7506;  // Port that the Python bridge forwards to (if useBridge=true)
     
     // Transform to apply to all points (sensor -> world frame)
     glm::mat4 sensorToWorld = glm::mat4(1.0f);
@@ -73,6 +82,11 @@ struct OusterConfig {
     
     // Camera ID to assign to all points from this sensor
     int32_t cameraId = 0;
+    
+    // Live streaming accumulation settings
+    // Accumulate multiple scans to show a complete persistent point cloud
+    int accumulateFrames = 10;  // Number of scans to keep (10 = ~1 second at 10Hz)
+    bool enableAccumulation = true;  // Enable frame accumulation for live streaming
 };
 
 using PointCloudCallback = std::function<void(const std::vector<PointCloudPoint>& points, double timestamp)>;
@@ -153,6 +167,13 @@ private:
     std::mutex m_pointCloudMutex;
     std::queue<std::pair<std::vector<PointCloudPoint>, double>> m_pointCloudQueue;
     static constexpr size_t MAX_QUEUE_SIZE = 10;
+    
+    // Accumulated point cloud for live streaming persistence
+    // Ring buffer of recent frames, merged into single output
+    std::deque<std::vector<PointCloudPoint>> m_accumulatedFrames;
+    std::vector<PointCloudPoint> m_accumulatedPointCloud;  // Merged result
+    bool m_accumulationDirty = false;  // Need to rebuild merged result
+    std::chrono::steady_clock::time_point m_lastAccumulationRebuildTime;  // For stale detection
     
     // Statistics
     std::atomic<int> m_frameCount{0};

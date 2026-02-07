@@ -17,87 +17,74 @@ from typing import Optional
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 
-# Try multiple SDK paths (check built versions first, then source)
-_sdk_paths = [
-    # Built/installed versions (preferred)
-    os.path.join(_script_dir, "ouster-sdk", "build", "py3.14.2", "ouster-sdk"),
-    os.path.join(_script_dir, "ouster-sdk", "build", "py3.13.2", "ouster-sdk"),
-    os.path.join(_script_dir, "ouster-sdk", "build", "py3.12.2", "ouster-sdk"),
-    os.path.join(_script_dir, "ouster-sdk", "build", "py3.11.2", "ouster-sdk"),
-    # Source versions
-    os.path.join(_script_dir, "ouster-sdk", "python", "src"),
-    os.path.join(_script_dir, "ouster-sdk", "python"),
-    os.path.join(_script_dir, "ouster-sdk"),
-    # Absolute paths (fallback)
-    "/Users/rgrigorii/Desktop/projects/thegame/camera_system/ouster/ouster-sdk/build/py3.14.2/ouster-sdk",
-    "/Users/rgrigorii/Desktop/projects/thegame/camera_system/ouster/ouster-sdk/python/src",
-    "/Users/rgrigorii/Desktop/projects/thegame/camera_system/ouster/ouster-sdk/python",
-    "/Users/rgrigorii/Desktop/projects/thegame/camera_system/ouster/ouster-sdk",
-]
-
+# First, try to import the pip-installed ouster SDK (preferred - has C++ bindings)
 _sdk_python_path = None
-for path in _sdk_paths:
-    if os.path.exists(path):
-        # Check if it's a valid Python package path
-        # For built versions, the structure is: build/py3.x.x/ouster-sdk/ouster/sdk/...
-        # For source versions, the structure is: python/src/ouster/sdk/...
-        ouster_sdk_path = os.path.join(path, "ouster", "sdk")
-        ouster_path = os.path.join(path, "ouster")
-        if os.path.exists(ouster_sdk_path) or os.path.exists(ouster_path):
-            if path not in sys.path:
-                sys.path.insert(0, path)
-            _sdk_python_path = path
-            print(f"✓ Found Ouster SDK at: {path}")
-            break
+try:
+    import ouster.sdk
+    _sdk_python_path = os.path.dirname(os.path.dirname(ouster.sdk.__file__))
+    print(f"✓ Found Ouster SDK (pip installed) at: {_sdk_python_path}")
+except ImportError:
+    # Fallback: Try local SDK paths (built versions first, then source)
+    _sdk_paths = [
+        # Built/installed versions (preferred)
+        os.path.join(_script_dir, "ouster-sdk", "build", "py3.14.2", "ouster-sdk"),
+        os.path.join(_script_dir, "ouster-sdk", "build", "py3.13.2", "ouster-sdk"),
+        os.path.join(_script_dir, "ouster-sdk", "build", "py3.12.2", "ouster-sdk"),
+        os.path.join(_script_dir, "ouster-sdk", "build", "py3.11.2", "ouster-sdk"),
+        os.path.join(_script_dir, "ouster-sdk", "build", "py3.9.6", "ouster-sdk"),
+        # Source versions (require C++ build)
+        os.path.join(_script_dir, "ouster-sdk", "python", "src"),
+        os.path.join(_script_dir, "ouster-sdk", "python"),
+        os.path.join(_script_dir, "ouster-sdk"),
+    ]
+
+    for path in _sdk_paths:
+        if os.path.exists(path):
+            ouster_sdk_path = os.path.join(path, "ouster", "sdk")
+            ouster_path = os.path.join(path, "ouster")
+            if os.path.exists(ouster_sdk_path) or os.path.exists(ouster_path):
+                if path not in sys.path:
+                    sys.path.insert(0, path)
+                _sdk_python_path = path
+                print(f"✓ Found Ouster SDK (local) at: {path}")
+                break
+    
+    if not _sdk_python_path:
+        print(f"⚠ Ouster SDK not found. Install with: pip install ouster-sdk")
 
 HAS_OUSTER_SDK = False
 SDK_IMPORT_ERROR = None
-if _sdk_python_path:
+
+# Check for required dependencies first - must have numpy before using SDK
+try:
+    import numpy
+    print(f"✓ numpy is available")
+except ImportError:
+    print(f"⚠ numpy is required for Ouster SDK but not installed")
+    print(f"  Install with: pip install numpy")
+    SDK_IMPORT_ERROR = "numpy not installed"
+
+if _sdk_python_path and SDK_IMPORT_ERROR is None:
     try:
-        # Check for required dependencies first - must have numpy before importing SDK
-        try:
-            import numpy
-            print(f"✓ numpy is available")
-        except ImportError:
-            print(f"⚠ numpy is required for Ouster SDK but not installed")
-            print(f"  Install with: pip3 install numpy")
-            HAS_OUSTER_SDK = False
-            SDK_IMPORT_ERROR = "numpy not installed"
-        else:
-            # Only try to import SDK if numpy is available
-            try:
-                from ouster.sdk import pcap, core, sensor
-                from ouster.sdk.core import LidarScan, ChanField, SensorInfo, Scans
-                HAS_OUSTER_SDK = True
-                print(f"✓ Successfully imported Ouster SDK from: {_sdk_python_path}")
-            except ImportError as e:
-                HAS_OUSTER_SDK = False
-                SDK_IMPORT_ERROR = str(e)
-                error_msg = str(e)
-                print(f"⚠ Failed to import Ouster SDK: {error_msg}")
-                print(f"  SDK path: {_sdk_python_path}")
-                
-                # Provide helpful error messages based on error type
-                if "_bindings" in error_msg.lower() or "initialization failed" in error_msg.lower():
-                    print(f"  C++ bindings not built or incompatible")
-                    print(f"  The SDK Python package requires compiled C++ extensions")
-                    print(f"  Try building the SDK: cd ouster-sdk && mkdir -p build && cd build && cmake .. && make")
-                elif "No module named" in error_msg:
-                    print(f"  Missing Python module - check SDK installation")
-                
-                # Only print full traceback if it's not a known dependency issue
-                if "_bindings" not in error_msg.lower() and "initialization failed" not in error_msg.lower():
-                    import traceback
-                    traceback.print_exc()
+        from ouster.sdk import pcap, core
+        from ouster.sdk.core import LidarScan, ChanField, SensorInfo, Scans
+        HAS_OUSTER_SDK = True
+        print(f"✓ Successfully imported Ouster SDK")
+    except ImportError as e:
+        HAS_OUSTER_SDK = False
+        SDK_IMPORT_ERROR = str(e)
+        error_msg = str(e)
+        print(f"⚠ Failed to import Ouster SDK: {error_msg}")
+        
+        if "_bindings" in error_msg.lower() or "initialization failed" in error_msg.lower():
+            print(f"  C++ bindings not built or incompatible")
+            print(f"  Install with: pip install ouster-sdk")
+        elif "No module named" in error_msg:
+            print(f"  Missing module - install with: pip install ouster-sdk")
     except Exception as e:
         HAS_OUSTER_SDK = False
         SDK_IMPORT_ERROR = str(e)
-        print(f"⚠ Unexpected error checking Ouster SDK: {e}")
-else:
-    print(f"⚠ Ouster SDK not found in any of these locations:")
-    for path in _sdk_paths[:6]:  # Show first 6 paths
-        exists = "✓" if os.path.exists(path) else "✗"
-        print(f"  {exists} {path}")
+        print(f"⚠ Unexpected error importing Ouster SDK: {e}")
 
 OUSTER_CLI_AVAILABLE = False
 try:
@@ -113,6 +100,13 @@ try:
 except ImportError:
     HAS_OPEN3D = False
 
+HAS_PLOTLY = False
+try:
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
+
 HAS_MATPLOTLIB = False
 try:
     import matplotlib.pyplot as plt
@@ -121,9 +115,10 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
-OUSTER_IP = "172.17.1.56"
+OUSTER_IP = "172.17.1.56"  # Sensor IP
 MAC_IP = "172.17.1.100"
-LIDAR_PORT = 7504
+LIDAR_PORT = 7510
+IMU_PORT = 7511
 
 
 def capture_pcap(hostname: str, lidar_port: int, timeout: float = 15.0) -> Optional[str]:
@@ -142,15 +137,18 @@ def capture_pcap(hostname: str, lidar_port: int, timeout: float = 15.0) -> Optio
         
         try:
             print(f"  Recording to {pcap_file}...")
-            capture_time = 10.0  # Increased timeout for recording
-            # Try different command syntaxes - ouster-cli uses "save" command, not "record"
+            capture_time = 15.0  # Increased timeout for recording
+            # ouster-cli syntax: source <host> slice <range> save <file>
+            # slice is required - can be frame count (0:100) or time (0s:10s)
             cmd_variations = [
+                # Time-based slice (10 seconds of data)
+                ["ouster-cli", "source", hostname, "slice", "0s:10s", "save", pcap_file],
+                # Frame-based slice (200 frames ~= 10 seconds at 20Hz)
+                ["ouster-cli", "source", hostname, "slice", "0:200", "save", pcap_file],
+                # Try without explicit output path (auto-generates filename)
+                ["ouster-cli", "source", hostname, "slice", "0s:10s", "save", ".pcap"],
+                # Older syntax variations (for compatibility)
                 ["ouster-cli", "source", hostname, "save", pcap_file],
-                ["ouster-cli", "source", hostname, "save", "-o", pcap_file],
-                ["ouster-cli", "source", hostname, "save", "--output", pcap_file],
-                # Also try record command (older syntax or different versions)
-                ["ouster-cli", "source", hostname, "record", "-o", pcap_file],
-                ["ouster-cli", "source", hostname, "record", "--output", pcap_file],
                 ["ouster-cli", "source", hostname, "record", pcap_file],
             ]
             
@@ -391,8 +389,17 @@ def capture_pcap(hostname: str, lidar_port: int, timeout: float = 15.0) -> Optio
     return None
 
 
-def load_and_plot_pcap(pcap_file: str, metadata_file: Optional[str] = None, grid_resolution: Optional[float] = None):
-    """Load a PCAP file and plot the point cloud"""
+def load_and_plot_pcap(pcap_file: str, metadata_file: Optional[str] = None, grid_resolution: Optional[float] = None,
+                       max_range: Optional[float] = None, min_range: Optional[float] = None):
+    """Load a PCAP file and plot the point cloud
+    
+    Args:
+        pcap_file: Path to the PCAP file
+        metadata_file: Path to metadata JSON file
+        grid_resolution: Optional grid snapping resolution in meters
+        max_range: Only show points closer than this distance (meters)
+        min_range: Only show points farther than this distance (meters)
+    """
     global HAS_OUSTER_SDK, SDK_IMPORT_ERROR
     
     if HAS_OUSTER_SDK:
@@ -413,10 +420,11 @@ def load_and_plot_pcap(pcap_file: str, metadata_file: Optional[str] = None, grid
         print("    pip install -e .")
         sys.exit(1)
     
-    if not HAS_OPEN3D and not HAS_MATPLOTLIB:
+    if not HAS_OPEN3D and not HAS_PLOTLY and not HAS_MATPLOTLIB:
         print("✗ No visualization library available - cannot plot point cloud")
-        print("  Install Open3D (recommended): pip install open3d")
-        print("  Or install matplotlib: pip install matplotlib")
+        print("  Install Plotly (recommended, browser-based): pip install plotly")
+        print("  Or install Open3D (desktop app): pip install open3d")
+        print("  Or install matplotlib (basic): pip install matplotlib")
         sys.exit(1)
     
     if not os.path.isabs(pcap_file):
@@ -609,7 +617,17 @@ def load_and_plot_pcap(pcap_file: str, metadata_file: Optional[str] = None, grid
         z = xyz[:, :, 2].flatten()
         i = intensity.flatten()
         
-        valid = ranges_m.flatten() > 0
+        ranges_flat = ranges_m.flatten()
+        valid = ranges_flat > 0
+        
+        # Apply range filtering
+        if min_range is not None:
+            valid = valid & (ranges_flat >= min_range)
+            print(f"  ✓ Filtering: min range = {min_range:.2f}m")
+        if max_range is not None:
+            valid = valid & (ranges_flat <= max_range)
+            print(f"  ✓ Filtering: max range = {max_range:.2f}m")
+        
         x = x[valid]
         y = y[valid]
         z = z[valid]
@@ -688,15 +706,18 @@ def snap_to_grid(x, y, z, intensity, grid_resolution):
 
 
 def render_point_cloud(x, y, z, intensity, num_points, title_suffix=""):
-    """Render point cloud using Open3D (preferred) or matplotlib (fallback)"""
+    """Render point cloud using Open3D (preferred), Plotly, or matplotlib (fallback)"""
     import numpy as np
     
     if HAS_OPEN3D:
         render_point_cloud_open3d(x, y, z, intensity, num_points, title_suffix)
+    elif HAS_PLOTLY:
+        render_point_cloud_plotly(x, y, z, intensity, num_points, title_suffix)
     elif HAS_MATPLOTLIB:
         render_point_cloud_matplotlib(x, y, z, intensity, num_points, title_suffix)
     else:
         print("✗ No visualization library available")
+        print("  Install one of: pip install plotly, pip install open3d, pip install matplotlib")
         sys.exit(1)
 
 
@@ -709,30 +730,159 @@ def render_point_cloud_open3d(x, y, z, intensity, num_points, title_suffix=""):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
     
-    i_norm = (intensity - intensity.min()) / (intensity.max() - intensity.min() + 1e-6)
-    
-    if HAS_MATPLOTLIB:
-        colors = plt.cm.viridis(i_norm)[:, :3]
-    else:
-        colors = viridis_colormap(i_norm)
-    
+    # Use white color for all points
+    colors = np.ones((len(points), 3))  # White (1, 1, 1)
     pcd.colors = o3d.utility.Vector3dVector(colors)
+    
+    # Create coordinate frame at origin (1 meter axes)
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
+    
+    # Create a ground grid for reference
+    grid_lines = []
+    grid_size = 20  # meters
+    grid_step = 2   # meters
+    for i in range(-grid_size, grid_size + 1, grid_step):
+        # Lines parallel to X axis
+        grid_lines.append([[i, -grid_size, 0], [i, grid_size, 0]])
+        # Lines parallel to Y axis
+        grid_lines.append([[-grid_size, i, 0], [grid_size, i, 0]])
+    
+    grid_points = []
+    grid_line_indices = []
+    for i, line in enumerate(grid_lines):
+        grid_points.extend(line)
+        grid_line_indices.append([i*2, i*2+1])
+    
+    grid = o3d.geometry.LineSet()
+    grid.points = o3d.utility.Vector3dVector(grid_points)
+    grid.lines = o3d.utility.Vector2iVector(grid_line_indices)
+    grid.colors = o3d.utility.Vector3dVector([[0.3, 0.3, 0.3] for _ in grid_line_indices])
     
     title = f'Ouster LiDAR Point Cloud ({num_points:,} points)'
     if title_suffix:
         title += f" {title_suffix}"
     
-    print(f"  Opening interactive 3D viewer...")
-    print(f"  Controls: Mouse drag to rotate, Shift+drag to pan, Scroll to zoom")
-    print(f"  Press 'Q' or close window to exit")
+    print()
+    print("  " + "=" * 50)
+    print("  Interactive 3D Point Cloud Viewer")
+    print("  " + "=" * 50)
+    print()
+    print("  Mouse Controls:")
+    print("    Left-drag:    Rotate view")
+    print("    Shift+drag:   Pan view")
+    print("    Ctrl+drag:    Roll view")
+    print("    Scroll:       Zoom in/out")
+    print()
+    print("  Keyboard Shortcuts:")
+    print("    Q:            Quit viewer")
+    print("    H:            Print help")
+    print("    R:            Reset view")
+    print("    +:            Increase point size")
+    print("    -:            Decrease point size")
+    print("    1:            Toggle point visibility")
+    print("    2:            Toggle normal visualization")
+    print("    L:            Toggle lighting")
+    print("    P:            Take screenshot")
+    print()
+    print(f"  Grid: {grid_size*2}m x {grid_size*2}m (step: {grid_step}m)")
+    print(f"  Coordinate frame: X=Red, Y=Green, Z=Blue (1m)")
+    print()
     
-    o3d.visualization.draw_geometries(
-        [pcd],
-        window_name=title,
-        width=1920,
-        height=1080,
-        point_show_normal=False
+    # Use advanced visualizer for more control
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name=title, width=1920, height=1080)
+    
+    vis.add_geometry(pcd)
+    vis.add_geometry(coord_frame)
+    vis.add_geometry(grid)
+    
+    # Set rendering options
+    opt = vis.get_render_option()
+    opt.point_size = 2.0
+    opt.background_color = np.array([0.1, 0.1, 0.15])  # Dark background
+    opt.show_coordinate_frame = False  # We have our own
+    
+    # Set initial view
+    ctr = vis.get_view_control()
+    ctr.set_zoom(0.5)
+    ctr.set_front([0, -1, 0.3])
+    ctr.set_lookat([0, 0, 0])
+    ctr.set_up([0, 0, 1])
+    
+    vis.run()
+    vis.destroy_window()
+
+
+def render_point_cloud_plotly(x, y, z, intensity, num_points, title_suffix=""):
+    """Render point cloud using Plotly - interactive browser-based visualization"""
+    import numpy as np
+    import plotly.graph_objects as go
+    
+    # Subsample if too many points (Plotly can be slow with >500k points)
+    max_points = 500000
+    if len(x) > max_points:
+        indices = np.random.choice(len(x), max_points, replace=False)
+        x, y, z = x[indices], y[indices], z[indices]
+        intensity = intensity[indices]
+        print(f"  Note: Subsampled to {max_points:,} points for smooth visualization")
+    
+    title = f'Ouster LiDAR Point Cloud ({num_points:,} points)'
+    if title_suffix:
+        title += f" {title_suffix}"
+    
+    print()
+    print("  " + "=" * 50)
+    print("  Interactive 3D Point Cloud Viewer (Plotly)")
+    print("  " + "=" * 50)
+    print()
+    print("  Opening in web browser...")
+    print()
+    print("  Controls:")
+    print("    Left-drag:    Rotate view")
+    print("    Right-drag:   Pan view")
+    print("    Scroll:       Zoom in/out")
+    print("    Double-click: Reset view")
+    print()
+    
+    # Create the 3D scatter plot with white points
+    fig = go.Figure(data=[go.Scatter3d(
+        x=x, y=y, z=z,
+        mode='markers',
+        marker=dict(
+            size=1.5,
+            color='white',
+            opacity=0.8,
+        ),
+        hovertemplate='X: %{x:.2f}m<br>Y: %{y:.2f}m<br>Z: %{z:.2f}m<extra></extra>'
+    )])
+    
+    # Add coordinate axes at origin
+    axis_length = 2.0
+    fig.add_trace(go.Scatter3d(x=[0, axis_length], y=[0, 0], z=[0, 0], 
+                               mode='lines', line=dict(color='red', width=5), name='X', showlegend=False))
+    fig.add_trace(go.Scatter3d(x=[0, 0], y=[0, axis_length], z=[0, 0], 
+                               mode='lines', line=dict(color='green', width=5), name='Y', showlegend=False))
+    fig.add_trace(go.Scatter3d(x=[0, 0], y=[0, 0], z=[0, axis_length], 
+                               mode='lines', line=dict(color='blue', width=5), name='Z', showlegend=False))
+    
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis_title='X (m)',
+            yaxis_title='Y (m)',
+            zaxis_title='Z (m)',
+            aspectmode='data',
+            bgcolor='rgb(20, 20, 30)',
+            xaxis=dict(gridcolor='rgb(50, 50, 60)', showbackground=True, backgroundcolor='rgb(30, 30, 40)'),
+            yaxis=dict(gridcolor='rgb(50, 50, 60)', showbackground=True, backgroundcolor='rgb(30, 30, 40)'),
+            zaxis=dict(gridcolor='rgb(50, 50, 60)', showbackground=True, backgroundcolor='rgb(30, 30, 40)'),
+        ),
+        paper_bgcolor='rgb(10, 10, 20)',
+        font=dict(color='white'),
+        margin=dict(l=0, r=0, b=0, t=40)
     )
+    
+    fig.show()
 
 
 def viridis_colormap(values):
@@ -752,12 +902,10 @@ def render_point_cloud_matplotlib(x, y, z, intensity, num_points, title_suffix="
     """Render point cloud using matplotlib - fallback option"""
     import numpy as np
     
-    i_norm = (intensity - intensity.min()) / (intensity.max() - intensity.min() + 1e-6)
-    
     fig = plt.figure(figsize=(12, 8))
     ax = fig.add_subplot(111, projection='3d')
     
-    scatter = ax.scatter(x, y, z, c=i_norm, cmap='viridis', s=0.5, alpha=0.6)
+    scatter = ax.scatter(x, y, z, c='white', s=0.5, alpha=0.6)
     
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
@@ -767,9 +915,345 @@ def render_point_cloud_matplotlib(x, y, z, intensity, num_points, title_suffix="
         title += f" {title_suffix}"
     ax.set_title(title)
     
-    plt.colorbar(scatter, ax=ax, label='Intensity (normalized)')
+    # No colorbar needed for white points
+    ax.set_facecolor('black')
     plt.tight_layout()
     plt.show()
+
+
+def stream_live(sensor_ip: str = None, metadata_file: str = None, lidar_port: int = None,
+                grid_resolution: float = None, max_range: float = None, min_range: float = None,
+                accumulate_frames: int = 1, force_matplotlib: bool = False,
+                point_size: float = 1.0, color_mode: str = 'white'):
+    """
+    Stream live LiDAR data using raw UDP sockets (bypasses macOS firewall) 
+    and SDK for packet parsing. Uses Open3D for fast visualization if available.
+    
+    Args:
+        sensor_ip: Sensor IP address (default: OUSTER_IP)
+        metadata_file: Path to metadata JSON file
+        lidar_port: UDP port for lidar data (default: LIDAR_PORT)
+        point_size: Size of points in visualization (default: 1.0)
+        color_mode: 'white', 'height', or 'distance' (default: 'white')
+        grid_resolution: Snap points to grid with this resolution (meters)
+        max_range: Only show points closer than this distance (meters)
+        min_range: Only show points farther than this distance (meters)
+        accumulate_frames: Number of frames to accumulate (1 = current frame only)
+        force_matplotlib: If True, use matplotlib even if Open3D is available
+    """
+    import numpy as np
+    import select
+    
+    global HAS_OUSTER_SDK
+    
+    if not HAS_OUSTER_SDK:
+        print("✗ Ouster SDK required for live streaming")
+        print("  Install with: pip install ouster-sdk")
+        sys.exit(1)
+    
+    # Use matplotlib by default (Open3D has GLFW conflicts with Ouster SDK on macOS)
+    use_open3d = False
+    if not HAS_MATPLOTLIB:
+        print("✗ matplotlib required for visualization")
+        print("  Install with: pip install matplotlib")
+        sys.exit(1)
+    print("  Using matplotlib for visualization")
+    
+    from ouster.sdk.core import (LidarScan, ChanField, SensorInfo, XYZLut, 
+                                  ScanBatcher, LidarPacket, PacketFormat)
+    
+    sensor_ip = sensor_ip or OUSTER_IP
+    lidar_port = lidar_port or LIDAR_PORT
+    
+    print("=" * 50)
+    print("   Ouster LiDAR Live Streaming")
+    print("=" * 50)
+    print()
+    print(f"Sensor IP: {sensor_ip}")
+    print(f"Lidar Port: {lidar_port}")
+    print(f"Accumulate: {accumulate_frames} frame(s)")
+    print()
+    
+    # Load metadata
+    if metadata_file is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        metadata_file = os.path.join(script_dir, "example", "metadata.json")
+    
+    if not os.path.exists(metadata_file):
+        print(f"✗ Metadata file not found: {metadata_file}")
+        print("  Attempting to fetch from sensor...")
+        try:
+            import urllib.request
+            url = f"http://{sensor_ip}/api/v1/sensor/metadata"
+            with urllib.request.urlopen(url, timeout=5) as response:
+                metadata_json = response.read().decode('utf-8')
+            info = SensorInfo(metadata_json)
+            print(f"  ✓ Fetched metadata from sensor: {info.prod_line} SN:{info.sn}")
+        except Exception as e:
+            print(f"  ✗ Failed to fetch metadata: {e}")
+            sys.exit(1)
+    else:
+        print(f"Loading metadata: {metadata_file}")
+        with open(metadata_file, 'r') as f:
+            metadata_json = f.read()
+        info = SensorInfo(metadata_json)
+        print(f"  ✓ Loaded metadata: {info.prod_line} SN:{info.sn}")
+    
+    # Create SDK objects for packet parsing
+    pf = PacketFormat.from_info(info)
+    batcher = ScanBatcher(info)
+    xyzlut = XYZLut(info)
+    
+    expected_packet_size = pf.lidar_packet_size
+    print(f"  Expected packet size: {expected_packet_size} bytes")
+    print(f"  Resolution: {info.format.columns_per_frame}x{info.format.pixels_per_column}")
+    
+    # Create UDP socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    sock.bind(('0.0.0.0', lidar_port))
+    sock.setblocking(False)
+    
+    print(f"  ✓ Listening on UDP port {lidar_port}")
+    print()
+    print("Waiting for LiDAR data... (press Ctrl+C or close window to exit)")
+    print()
+    
+    # Initialize visualization
+    if use_open3d:
+        vis = o3d.visualization.Visualizer()
+        vis.create_window("Ouster Live - Press Q to quit", width=1400, height=900)
+        pcd = o3d.geometry.PointCloud()
+        vis.add_geometry(pcd)
+        
+        # Set rendering options
+        opt = vis.get_render_option()
+        opt.background_color = np.array([0.1, 0.1, 0.1])
+        opt.point_size = 1.5
+        
+        # Set initial view
+        ctr = vis.get_view_control()
+        ctr.set_zoom(0.3)
+    else:
+        plt.ion()
+        fig = plt.figure(figsize=(14, 10))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_facecolor('black')
+        fig.patch.set_facecolor('black')
+        scatter = None
+        
+        # Add mouse wheel zoom
+        zoom_state = {'scale': 1.0}
+        def on_scroll(event):
+            if event.inaxes != ax:
+                return
+            factor = 1.2 if event.button == 'down' else 1/1.2
+            zoom_state['scale'] *= factor
+            # Scale affects the axis limits - will be applied during updates
+        fig.canvas.mpl_connect('scroll_event', on_scroll)
+        
+        print(f"  Controls: Drag to rotate, Scroll to zoom")
+        print(f"  Color: {color_mode}, Point size: {point_size}")
+    
+    # State variables
+    current_points = None  # Current frame's points (no accumulation by default)
+    frame_count = 0
+    packet_count = 0
+    parse_errors = 0
+    last_update_time = time.time()
+    
+    # Create LidarScan buffer
+    scan = LidarScan(info.format.pixels_per_column, info.format.columns_per_frame, 
+                     info.format.udp_profile_lidar)
+    packet = LidarPacket(expected_packet_size)
+    
+    running = True
+    try:
+        while running:
+            # Check if window is still open
+            if use_open3d:
+                if not vis.poll_events():
+                    break
+                vis.update_renderer()
+            else:
+                if not plt.fignum_exists(fig.number):
+                    break
+            
+            # Drain ALL available packets from socket buffer (critical for keeping up with 10Hz sensor)
+            packets_this_iteration = 0
+            max_packets_per_iteration = 200  # Process up to 200 packets before updating display
+            
+            while packets_this_iteration < max_packets_per_iteration:
+                ready, _, _ = select.select([sock], [], [], 0.001)
+                if not ready:
+                    break
+                    
+                try:
+                    data, addr = sock.recvfrom(65535)
+                    packet_count += 1
+                    packets_this_iteration += 1
+                    
+                    if len(data) != expected_packet_size:
+                        parse_errors += 1
+                        continue
+                    
+                    packet.buf[:] = np.frombuffer(data, dtype=np.uint8)
+                    
+                    # Process packet - returns True when full scan is complete
+                    if batcher(packet, scan):
+                        frame_count += 1
+                        
+                        # Extract XYZ using SDK
+                        xyz = xyzlut(scan.field(ChanField.RANGE))
+                        ranges = scan.field(ChanField.RANGE).astype(np.float32) * 0.001  # mm to m
+                        
+                        # Debug: show raw range stats on first few frames
+                        if frame_count <= 3:
+                            total_pts = ranges.size
+                            nonzero = np.count_nonzero(ranges)
+                            if nonzero > 0:
+                                r_valid = ranges[ranges > 0]
+                                print(f"  DEBUG frame {frame_count}: {total_pts} total, {nonzero} nonzero ({100*nonzero/total_pts:.1f}%), range: [{r_valid.min():.2f}, {r_valid.max():.2f}] m")
+                            else:
+                                print(f"  DEBUG frame {frame_count}: {total_pts} total, 0 nonzero")
+                        
+                        # Flatten
+                        x = xyz[:, :, 0].flatten()
+                        y = xyz[:, :, 1].flatten()
+                        z = xyz[:, :, 2].flatten()
+                        r = ranges.flatten()
+                        
+                        # Filter valid points (range > 0)
+                        valid = r > 0
+                        if min_range is not None:
+                            valid &= (r >= min_range)
+                        if max_range is not None:
+                            valid &= (r <= max_range)
+                        
+                        x, y, z = x[valid], y[valid], z[valid]
+                        
+                        if len(x) > 0:
+                            new_points = np.column_stack((x, y, z))
+                            
+                            # Replace current points (no accumulation when accumulate_frames=1)
+                            if accumulate_frames <= 1:
+                                current_points = new_points
+                            else:
+                                # Accumulate frames
+                                if current_points is None:
+                                    current_points = new_points
+                                else:
+                                    current_points = np.vstack([current_points, new_points])
+                                    # Limit total points
+                                    max_pts = accumulate_frames * 100000
+                                    if len(current_points) > max_pts:
+                                        current_points = current_points[-max_pts:]
+                            
+                            # Log stats
+                            if frame_count == 1 or frame_count % 10 == 0:
+                                dist = np.sqrt(x**2 + y**2 + z**2)
+                                print(f"  Frame {frame_count}: {len(x):,} pts, range: [{dist.min():.1f}, {dist.max():.1f}] m")
+                        
+                        # Reset scan buffer
+                        scan = LidarScan(info.format.pixels_per_column, 
+                                        info.format.columns_per_frame,
+                                        info.format.udp_profile_lidar)
+                        
+                except socket.error:
+                    break  # No more data available
+                except Exception as e:
+                    parse_errors += 1
+                    if parse_errors <= 3:
+                        print(f"  ⚠ Parse error: {e}")
+            
+            # Allow matplotlib to process events
+            if not use_open3d:
+                plt.pause(0.001)
+            
+            # Update visualization (every frame for Open3D, throttled for matplotlib)
+            current_time = time.time()
+            should_update = current_points is not None
+            
+            if not use_open3d:
+                # Throttle matplotlib updates
+                should_update = should_update and (current_time - last_update_time >= 0.1)
+            
+            if should_update:
+                last_update_time = current_time
+                
+                if use_open3d:
+                    # Open3D update - very fast
+                    pcd.points = o3d.utility.Vector3dVector(current_points)
+                    
+                    # Color by height
+                    colors = np.zeros((len(current_points), 3))
+                    z_norm = (current_points[:, 2] - current_points[:, 2].min()) 
+                    z_range = current_points[:, 2].max() - current_points[:, 2].min()
+                    if z_range > 0:
+                        z_norm = z_norm / z_range
+                    colors[:, 0] = 1.0  # Red channel
+                    colors[:, 1] = 1.0 - z_norm * 0.5  # Slight gradient
+                    colors[:, 2] = 1.0 - z_norm * 0.5
+                    pcd.colors = o3d.utility.Vector3dVector(colors)
+                    
+                    vis.update_geometry(pcd)
+                else:
+                    # Matplotlib update - slower
+                    ax.clear()
+                    
+                    # Subsample for performance
+                    pts = current_points
+                    if len(pts) > 50000:
+                        idx = np.random.choice(len(pts), 50000, replace=False)
+                        pts = pts[idx]
+                    
+                    # Calculate distances for stats/coloring
+                    dist = np.sqrt(pts[:, 0]**2 + pts[:, 1]**2 + pts[:, 2]**2)
+                    
+                    # Determine colors based on color_mode
+                    if color_mode == 'height':
+                        z_vals = pts[:, 2]
+                        z_norm = (z_vals - z_vals.min()) / (z_vals.max() - z_vals.min() + 1e-6)
+                        colors = plt.cm.turbo(z_norm)
+                    elif color_mode == 'distance':
+                        d_norm = (dist - dist.min()) / (dist.max() - dist.min() + 1e-6)
+                        colors = plt.cm.viridis(d_norm)
+                    else:  # white
+                        colors = 'white'
+                    
+                    ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], 
+                              c=colors, s=point_size, alpha=0.8)
+                    
+                    dist_full = np.sqrt(current_points[:, 0]**2 + current_points[:, 1]**2 + current_points[:, 2]**2)
+                    ax.set_title(f'Frame {frame_count} | {len(current_points):,} pts | {dist_full.min():.1f}-{dist_full.max():.1f}m',
+                                color='white', fontsize=10)
+                    ax.set_facecolor('black')
+                    ax.set_xlabel('X', color='white')
+                    ax.set_ylabel('Y', color='white')
+                    ax.set_zlabel('Z', color='white')
+                    ax.tick_params(colors='white')
+                    
+                    # Auto-scale with zoom
+                    lim = np.percentile(np.abs(pts), 95) * 1.2
+                    lim = max(lim, 3.0)
+                    lim = lim * zoom_state['scale']  # Apply zoom
+                    ax.set_xlim(-lim, lim)
+                    ax.set_ylim(-lim, lim)
+                    ax.set_zlim(-lim/2, lim/2)
+                    
+                    plt.draw()
+    
+    except KeyboardInterrupt:
+        print("\n\nStopped by user")
+    finally:
+        sock.close()
+        if use_open3d:
+            vis.destroy_window()
+        else:
+            plt.close()
+    
+    print(f"\nProcessed {frame_count} frames, {packet_count} packets")
 
 
 def main():
@@ -778,17 +1262,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Capture live lidar data to PCAP
-  python3 setup_ouster.py
+  # Stream live LiDAR data (uses raw sockets to bypass macOS firewall)
+  python3 setup_ouster.py --live
+  python3 setup_ouster.py --live --sensor-ip 169.254.183.253 --metadata example/metadata.json
+  python3 setup_ouster.py --live --max-range 10  # Only show points within 10m
   
-  # Load and plot a saved PCAP file (uses Open3D if available, matplotlib otherwise)
+  # Load and plot a saved PCAP file
   python3 setup_ouster.py --load-packet ouster.pcap --metadata metadata.json
   
   # Load and plot with grid snapping (10cm resolution)
   python3 setup_ouster.py --load-packet ouster.pcap --grid-resolution 0.1
 
 Note: For best visualization, install Open3D: pip install open3d
-      Open3D provides interactive 3D viewing with rotation, zoom, and pan controls.
+      The --live mode uses raw Python sockets which bypass macOS firewall restrictions
+      on unsigned binaries, while still using the Ouster SDK for packet parsing.
         """
     )
     
@@ -809,6 +1296,22 @@ Note: For best visualization, install Open3D: pip install open3d
     )
     
     parser.add_argument(
+        '--max-range',
+        '--max_range',
+        type=float,
+        metavar='DISTANCE',
+        help='Only show points closer than this distance (in meters)'
+    )
+    
+    parser.add_argument(
+        '--min-range',
+        '--min_range',
+        type=float,
+        metavar='DISTANCE',
+        help='Only show points farther than this distance (in meters)'
+    )
+    
+    parser.add_argument(
         '--grid-resolution',
         '--grid_resolution',
         type=float,
@@ -817,11 +1320,80 @@ Note: For best visualization, install Open3D: pip install open3d
         help='Snap points to grid with given resolution in meters (e.g., 0.1 for 10cm grid)'
     )
     
+    parser.add_argument(
+        '--live',
+        action='store_true',
+        help='Stream live LiDAR data from sensor (uses raw sockets to bypass macOS firewall)'
+    )
+    
+    parser.add_argument(
+        '--sensor-ip',
+        '--sensor_ip',
+        metavar='IP',
+        dest='sensor_ip',
+        help=f'Sensor IP address for live streaming (default: {OUSTER_IP})'
+    )
+    
+    parser.add_argument(
+        '--port',
+        type=int,
+        metavar='PORT',
+        help=f'UDP port for lidar data (default: {LIDAR_PORT})'
+    )
+    
+    parser.add_argument(
+        '--accumulate',
+        type=int,
+        default=1,
+        metavar='FRAMES',
+        help='Number of frames to accumulate for live display (default: 1 = current frame only)'
+    )
+    
+    parser.add_argument(
+        '--no-open3d',
+        action='store_true',
+        dest='no_open3d',
+        help='Force matplotlib visualization (avoid Open3D/GLFW conflicts)'
+    )
+    
+    parser.add_argument(
+        '--point-size',
+        '--point_size',
+        type=float,
+        default=1.0,
+        metavar='SIZE',
+        help='Point size for visualization (default: 1.0)'
+    )
+    
+    parser.add_argument(
+        '--color',
+        choices=['white', 'height', 'distance'],
+        default='white',
+        help='Point coloring mode: white, height (z-axis), or distance (default: white)'
+    )
+    
     args = parser.parse_args()
+    
+    # Live streaming mode
+    if args.live:
+        stream_live(
+            sensor_ip=args.sensor_ip,
+            metadata_file=args.metadata,
+            lidar_port=args.port,
+            grid_resolution=args.grid_resolution,
+            max_range=args.max_range,
+            min_range=args.min_range,
+            accumulate_frames=args.accumulate,
+            force_matplotlib=args.no_open3d,
+            point_size=args.point_size,
+            color_mode=args.color
+        )
+        return
     
     if args.load_packet is not None:
         pcap_file = args.load_packet if args.load_packet else 'ouster.pcap'
-        load_and_plot_pcap(pcap_file, args.metadata, args.grid_resolution)
+        load_and_plot_pcap(pcap_file, args.metadata, args.grid_resolution,
+                          max_range=args.max_range, min_range=args.min_range)
         return
     
     print("=" * 50)
