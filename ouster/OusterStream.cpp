@@ -120,7 +120,20 @@ void OusterStream::ClearFileLoadedState() {
     m_packetLoadedFromFile = false;
     m_loadedPacketPoints.clear();
     m_loadedPacketTimestamp = 0.0;
-    LOG_INFO("OusterStream", "Cleared file-loaded state");
+    
+    // Also clear live streaming accumulated data
+    {
+        std::lock_guard<std::mutex> lock(m_pointCloudMutex);
+        m_accumulatedFrames.clear();
+        m_accumulatedPointCloud.clear();
+        m_accumulationDirty = false;
+        // Clear legacy queue too
+        while (!m_pointCloudQueue.empty()) {
+            m_pointCloudQueue.pop();
+        }
+    }
+    
+    LOG_INFO("OusterStream", "Cleared file-loaded state and live streaming buffers");
 }
 
 bool OusterStream::LoadMetadataFromFile(const std::string& metadataFile) {
@@ -143,10 +156,15 @@ PointCloudPoint OusterStream::CalculatePoint3D(uint16_t measurementId, int beam,
     float theta_azimuth = -2.0f * M_PI * (beamAzimuthAngles[beam] / 360.0f);
     float phi = 2.0f * M_PI * (beamAltitudeAngles[beam] / 360.0f);
     
+    // Ouster coordinate formula (from SDK documentation):
+    // n = lidar_origin_to_beam_origin_mm (distance from lidar origin to beam origin)
+    // x = (range - n) * cos(encoder + azimuth) * cos(altitude) + n * cos(encoder)
+    // y = (range - n) * sin(encoder + azimuth) * cos(altitude) + n * sin(encoder)
+    // z = (range - n) * sin(altitude) + beam_to_lidar_z_offset
     float n = m_lidarOriginToBeamOriginMm;
-    float r_mm = range * 1000.0f;
-    float x_lidar = (r_mm - n) * cosf(theta_encoder + theta_azimuth) * cosf(phi) + m_beamToLidarTransform[0 * 4 + 3] * cosf(theta_encoder);
-    float y_lidar = (r_mm - n) * sinf(theta_encoder + theta_azimuth) * cosf(phi) + m_beamToLidarTransform[0 * 4 + 3] * sinf(theta_encoder);
+    float r_mm = range * 1000.0f;  // range in meters -> millimeters
+    float x_lidar = (r_mm - n) * cosf(theta_encoder + theta_azimuth) * cosf(phi) + n * cosf(theta_encoder);
+    float y_lidar = (r_mm - n) * sinf(theta_encoder + theta_azimuth) * cosf(phi) + n * sinf(theta_encoder);
     float z_lidar = (r_mm - n) * sinf(phi) + m_beamToLidarTransform[2 * 4 + 3];
     
     float x_sensor_mm = m_lidarToSensorTransform[0 * 4 + 0] * x_lidar + m_lidarToSensorTransform[0 * 4 + 1] * y_lidar + m_lidarToSensorTransform[0 * 4 + 2] * z_lidar + m_lidarToSensorTransform[0 * 4 + 3];
@@ -222,6 +240,7 @@ glm::vec3 OusterStream::MapToColor(float intensity, float range) {
 }
 
 bool OusterStream::PollPointCloud(std::vector<PointCloudPoint>& outPoints, double& outTimestamp) {
+    // Priority 1: File-loaded data (PCAP, packet files)
     if (m_packetLoadedFromFile && !m_loadedPacketPoints.empty()) {
         outPoints = m_loadedPacketPoints;
         outTimestamp = m_loadedPacketTimestamp;
@@ -229,7 +248,64 @@ bool OusterStream::PollPointCloud(std::vector<PointCloudPoint>& outPoints, doubl
     }
     
     std::lock_guard<std::mutex> lock(m_pointCloudMutex);
+    
+    // Priority 2: Accumulated live streaming data (persistent point cloud)
+    if (m_config.enableAccumulation && !m_accumulatedFrames.empty()) {
+        // Rebuild merged point cloud if dirty
+        if (m_accumulationDirty) {
+            m_accumulatedPointCloud.clear();
+            size_t totalSize = 0;
+            for (const auto& frame : m_accumulatedFrames) {
+                totalSize += frame.size();
+            }
+            m_accumulatedPointCloud.reserve(totalSize);
+            
+            for (const auto& frame : m_accumulatedFrames) {
+                m_accumulatedPointCloud.insert(m_accumulatedPointCloud.end(), 
+                                               frame.begin(), frame.end());
+            }
+            m_accumulationDirty = false;
+            m_lastAccumulationRebuildTime = std::chrono::steady_clock::now();
+        }
+        
+        if (!m_accumulatedPointCloud.empty()) {
+            outPoints = m_accumulatedPointCloud;  // Copy (we want to keep it)
+            outTimestamp = m_lastTimestamp;
+            
+            static int pollCount = 0;
+            static bool warnedStale = false;
+            pollCount++;
+            
+            // Check for stale data (no updates for 3+ seconds)
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                now - m_lastAccumulationRebuildTime).count();
+            
+            if (elapsed >= 3 && !warnedStale) {
+                LOG_WARNING_FMT("OusterStream", "Accumulated point cloud is stale (%lld sec since last update)", 
+                               static_cast<long long>(elapsed));
+                warnedStale = true;
+            } else if (elapsed < 3) {
+                warnedStale = false;
+            }
+            
+            if (pollCount % 30 == 0) {
+                LOG_INFO_FMT("OusterStream", "PollPointCloud: returning %zu accumulated points from %zu frames", 
+                            outPoints.size(), m_accumulatedFrames.size());
+            }
+            return true;
+        }
+    }
+    
+    // Priority 3: Legacy queue mode (single frame at a time)
+    static int pollCount = 0;
+    pollCount++;
+    
     if (m_pointCloudQueue.empty()) {
+        if (pollCount % 60 == 0) {
+            LOG_INFO_FMT("OusterStream", "Poll #%d: queue empty, enableAccum=%d, accumFramesSize=%zu", 
+                        pollCount, m_config.enableAccumulation ? 1 : 0, m_accumulatedFrames.size());
+        }
         return false;
     }
     
@@ -237,6 +313,10 @@ bool OusterStream::PollPointCloud(std::vector<PointCloudPoint>& outPoints, doubl
     outPoints = std::move(front.first);
     outTimestamp = front.second;
     m_pointCloudQueue.pop();
+    
+    if (pollCount <= 5 || pollCount % 30 == 0) {
+        LOG_INFO_FMT("OusterStream", "Poll #%d: returning %zu points from queue", pollCount, outPoints.size());
+    }
     return true;
 }
 

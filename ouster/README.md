@@ -1,100 +1,106 @@
 # Ouster LiDAR Setup Guide
 
-## Your Sensor
+## Sensor Info
+
 | Property | Value |
 |----------|-------|
 | Model | OS-0-128 |
 | Serial | 122212001833 |
-| Firmware | v2.3.1 |
-| IP Address | **172.17.1.56** |
-| Web UI | http://172.17.1.56 |
+| Sensor IP | 172.17.1.56 |
+| Mac IP | 172.17.1.100 |
+| Lidar Port | 7510 |
+| IMU Port | 7513 |
 
 ## Quick Start
 
-### 1. Connect the Ouster
-- Power the Type-3 interface box (12V@3A or 24V@1.5A)
-- Connect RJ45 Ethernet to your USB-C adapter
+### 1. Configure Network
 
-### 2. Run the Setup Script
 ```bash
-bash /Users/rgrigorii/Desktop/projects/ouster/setup_ouster_network.sh
+cd /Users/rgrigorii/Desktop/projects/camera_system/LidarSDKWrapper/ouster
+bash setup_ouster_network.sh
 ```
 
-This adds the `172.17.1.100` IP to your Ethernet adapter so you can reach the sensor.
+This assigns `172.17.1.100` to your Ethernet adapter so you can reach the sensor at `172.17.1.56`.
 
-### 3. Verify Connection
+### 2. Verify Connection
+
 ```bash
 ping 172.17.1.56
+curl http://172.17.1.56/api/v1/sensor/metadata
 ```
 
-### 4. Access Web UI
-Open in browser: http://172.17.1.56
+## Running Live LiDAR in camera_system
 
-### 5. View Live Point Cloud
+Due to macOS firewall restrictions on unsigned binaries, we use a Python UDP bridge.
+
+### Terminal 1: Start the UDP Bridge
+
+```bash
+cd /Users/rgrigorii/Desktop/projects/camera_system/LidarSDKWrapper/ouster
+python3 udp_bridge.py
+```
+
+The bridge listens on UDP port 7510 and forwards packets via Unix socket to the C++ app.
+
+### Terminal 2: Run the Application
+
+```bash
+cd /Users/rgrigorii/Desktop/projects/camera_system/build
+./bin/camera_system_editor \
+  --ouster-metadata ../LidarSDKWrapper/ouster/example/metadata.json \
+  --lidar-config ../config/lidar.config
+```
+
+Then enable "Lidar Live" in the UI.
+
+## Get Fresh Metadata
+
+If point cloud looks wrong, fetch metadata directly from your sensor:
+
+```bash
+curl http://172.17.1.56/api/v1/sensor/metadata > fresh_metadata.json
+```
+
+Then use `--ouster-metadata fresh_metadata.json`
+
+## Configuration Files
+
+| File | Purpose |
+|------|---------|
+| `config/lidar.config` | Range filtering, frame retention, downsampling |
+| `example/metadata.json` | Sensor calibration data for XYZ transformation |
+
+### lidar.config Options
+
+```ini
+retain_frames = 0       # 0 = show current frame only, N = accumulate N frames
+min_range = 0.5         # Filter points closer than this (meters)
+max_range = 100.0       # Filter points farther than this (meters)
+downsample_factor = 1   # 1 = all points, 2 = every 2nd point, etc.
+```
+
+## Troubleshooting
+
+### No data received
+1. Check bridge is running: `python3 udp_bridge.py`
+2. Verify sensor is streaming: `curl http://172.17.1.56/api/v1/sensor/config | grep udp`
+3. Check network: `ping 172.17.1.56`
+
+### Points only show close range
+- Fetch fresh metadata from sensor (see above)
+- Check sensor orientation - is it blocked by nearby objects?
+
+### "No data for X seconds" in logs
+- Sensor may have gone idle - access web UI to wake it
+- Check UDP bridge is receiving packets
+
+## Alternative: View with ouster-cli
+
 ```bash
 ouster-cli source 172.17.1.56 viz
 ```
 
-**Note:** Your sensor has firmware v2.3.1 which is slightly older. Some CLI features require v2.4+.
-
-## Recording Data
-
-### Save PCAP (raw packets)
-```bash
-ouster-cli source 172.17.1.56 save data.pcap
-```
-
-### Replay recorded data
-```bash
-ouster-cli source data.pcap viz
-```
-
-## Network Configuration
-
-Your setup uses dual IPs to avoid conflicts with your home Wi-Fi:
-
-| Interface | IP | Subnet | Purpose |
-|-----------|-----|--------|---------|
-| Wi-Fi (en0) | DHCP | 192.168.1.x | Internet (NETGEAR) |
-| Ethernet (en8) | 172.17.1.100 | 172.17.1.x | Ouster sensor |
-
-**Important:** The Ethernet IP doesn't persist after reboot. Run `setup_ouster_network.sh` each time you connect the Ouster.
-
-## Troubleshooting
-
-### Internet stops working when Ouster is connected
-Run the setup script to configure the network properly:
-```bash
-bash setup_ouster_network.sh
-```
-
-### Can't reach the sensor
-1. Check cable connection
-2. Verify Ethernet link: `ifconfig en8 | grep status`
-3. Discover sensors: `ouster-cli discover`
-
-### CLI shows "firmware version not supported"
-Your sensor has v2.3.1. Some CLI features require v2.4+. Use the web UI instead, or update firmware from http://172.17.1.56
-
-## Python API Example
-
-```python
-from ouster import client
-
-sensor_hostname = "172.17.1.56"
-
-with client.Sensor(sensor_hostname) as sensor:
-    info = sensor.metadata
-    print(f"Product: {info.prod_line}")
-    print(f"Serial: {info.sn}")
-    
-    for scan in client.Scans(sensor):
-        range_field = scan.field(client.ChanField.RANGE)
-        print(f"Scan timestamp: {scan.timestamp}")
-        break
-```
-
 ## Useful Links
+
 - [Sensor Web UI](http://172.17.1.56)
-- [Ouster SDK Documentation](https://static.ouster.dev/sdk-docs/)
-- [Ouster GitHub](https://github.com/ouster-lidar/ouster-sdk)
+- [Ouster SDK Docs](https://static.ouster.dev/sdk-docs/)

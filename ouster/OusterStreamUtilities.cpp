@@ -197,39 +197,26 @@ bool KillProcessesOnPort(int port) {
 
 bool VerifyPortIsFree(int port) {
 #ifdef __APPLE__
-    // Create a test UDP socket and try to bind to the port
-    int testSock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (testSock < 0) {
-        return false;  // Can't create socket, assume port check failed
+    // NOTE: We no longer do a test bind because it creates TIME_WAIT state
+    // which prevents the actual bind later. Instead, just check if any
+    // process is actively listening on the port using lsof.
+    
+    char checkCmd[256];
+    snprintf(checkCmd, sizeof(checkCmd), "lsof -ti :%d 2>/dev/null | wc -l", port);
+    FILE* fp = popen(checkCmd, "r");
+    if (fp) {
+        char buf[128];
+        if (fgets(buf, sizeof(buf), fp) != nullptr) {
+            int count = atoi(buf);
+            pclose(fp);
+            // Port is free if no processes are using it
+            return (count == 0);
+        }
+        pclose(fp);
     }
     
-    // Set SO_REUSEADDR and SO_REUSEPORT to allow binding even if port is in TIME_WAIT
-    int reuse = 1;
-    setsockopt(testSock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    setsockopt(testSock, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-    
-    // Set SO_LINGER to 0 to force immediate close (avoid TIME_WAIT on test socket)
-    struct linger lingerOpt;
-    lingerOpt.l_onoff = 1;
-    lingerOpt.l_linger = 0;
-    setsockopt(testSock, SOL_SOCKET, SO_LINGER, &lingerOpt, sizeof(lingerOpt));
-    
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-    
-    bool canBind = (bind(testSock, (struct sockaddr*)&addr, sizeof(addr)) == 0);
-    
-    // Shutdown before close to ensure immediate release
-    shutdown(testSock, SHUT_RDWR);
-    close(testSock);
-    
-    // Small delay to ensure socket is fully closed
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    
-    return canBind;
+    // If we can't check, assume port is free (let the actual bind fail if not)
+    return true;
 #else
     // On other platforms, just return true (assume port is free)
     return true;
