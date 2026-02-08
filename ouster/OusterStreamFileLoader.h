@@ -1,20 +1,21 @@
 #pragma once
 
-#include "OusterStream.h"
+// ============================================================================
+// OusterStreamFileLoader.h - File loading for Ouster streams
+// ============================================================================
+
 #include <string>
+#include <cstdint>
 
 namespace Engine {
 namespace Editors {
 namespace CameraSystem {
 
-// Forward declaration
 class OusterStream;
 
-// File loading functionality for Ouster streams
 namespace OusterFileLoader {
 
-// Load metadata from JSON file (for use with live streaming)
-// This allows faster initialization and offline operation
+// Load metadata from JSON file (for SDK initialization)
 bool LoadMetadataFromFile(OusterStream* stream, const std::string& metadataFile);
 
 // Load and parse a PCAP file with metadata JSON
@@ -23,20 +24,13 @@ bool LoadPcapFromFile(OusterStream* stream, const std::string& pcapFile, const s
 // Load and parse a saved packet file (for debugging)
 bool LoadPacketFromFile(OusterStream* stream, const std::string& filename);
 
-// Parse metadata JSON file and extract beam angles, packet format, etc.
-// Internal implementation (friend function)
+// Parse metadata JSON file - internal implementation
 bool ParseMetadataFileImpl(OusterStream* stream, const std::string& metadataFile);
 
-// Process lidar packet when loading from file (uses member variables)
-// Internal implementation (friend function)
+// Process lidar packet from file - internal implementation
 void ProcessLidarPacketFromFileImpl(OusterStream* stream, const uint8_t* data, size_t size);
 
-// Manual parsing functions (fallback when SDK not available)
-bool LoadPcapFromFileManual(OusterStream* stream, const std::string& pcapFile, const std::string& metadataFile);
-void ProcessLidarPacketFromFileManual(OusterStream* stream, const uint8_t* data, size_t size);
-
 } // namespace OusterFileLoader
-
 } // namespace CameraSystem
 } // namespace Editors
 } // namespace Engine

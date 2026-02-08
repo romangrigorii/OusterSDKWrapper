@@ -1,13 +1,12 @@
 #pragma once
 
-#include "OusterStream.h"
-#include <thread>
+// ============================================================================
+// OusterStreamUtilities.h - Port management utilities
+// ============================================================================
 
 namespace Engine {
 namespace Editors {
 namespace CameraSystem {
-
-// Utility functions for Ouster stream management
 namespace OusterUtilities {
 
 // Kill processes using a specific port (macOS/Linux)
@@ -15,11 +14,10 @@ namespace OusterUtilities {
 // Returns true if ports appear to be free after cleanup
 bool KillProcessesOnPort(int port);
 
-// Verify that a port is actually free by attempting to bind to it
+// Verify that a port is actually free by checking lsof
 bool VerifyPortIsFree(int port);
 
 } // namespace OusterUtilities
-
 } // namespace CameraSystem
 } // namespace Editors
 } // namespace Engine

@@ -1,5 +1,9 @@
 #pragma once
 
+// ============================================================================
+// OusterStream.h - Main Ouster LiDAR streaming class
+// ============================================================================
+
 #include "../remesh/Remeshing.h"  // For PointCloudPoint
 #include <glm/glm.hpp>
 #include <vector>
@@ -14,8 +18,6 @@
 #include <chrono>
 
 // Forward declarations for Ouster SDK types
-// These are always declared (even when SDK not available) to avoid compilation errors
-// The actual usage is guarded by #ifdef OUSTER_SDK_AVAILABLE
 namespace ouster {
 namespace sdk {
 namespace sensor {
@@ -23,8 +25,6 @@ class SensorScanSource;
 }
 namespace core {
 class SensorInfo;
-// Note: XYZLut is a typedef (using XYZLut = XYZLutT<double>), not a class
-// We can't forward declare typedefs, so we'll handle it differently in the implementation
 }
 }
 }
@@ -36,71 +36,59 @@ namespace CameraSystem {
 // Forward declare OusterStream class
 class OusterStream;
 
-// Forward declare namespace functions for friend declarations
-namespace OusterFileLoader {
-    bool LoadMetadataFromFile(OusterStream* stream, const std::string& metadataFile);
-    bool LoadPcapFromFile(OusterStream* stream, const std::string& pcapFile, const std::string& metadataFile);
-    bool LoadPacketFromFile(OusterStream* stream, const std::string& filename);
-    bool ParseMetadataFileImpl(OusterStream* stream, const std::string& metadataFile);
-    void ProcessLidarPacketFromFileImpl(OusterStream* stream, const uint8_t* data, size_t size);
-}
-
-namespace OusterLiveStreaming {
-    bool Connect(OusterStream* stream);
-    void Disconnect(OusterStream* stream);
-    void StartStreaming(OusterStream* stream);
-    void StopStreaming(OusterStream* stream);
-    void StreamingThreadImpl(OusterStream* stream);
-    void ProcessLidarPacketImpl(OusterStream* stream, const uint8_t* data, size_t size);
-}
-
-// Ouster sensor configuration
+// ============================================================================
+// OusterConfig - Sensor configuration
+// ============================================================================
 struct OusterConfig {
     std::string hostname = "172.17.1.56";  // Ouster sensor IP
-    std::string localIp = "172.17.1.100";  // Local IP to bind to (on same network as sensor)
-    int lidarPort = 7510;  // Port sensor sends lidar data to
-    int imuPort = 7513;    // Port sensor sends IMU data to (use 7513 to avoid 7503 conflicts)
+    std::string localIp = "172.17.1.100";  // Local IP to bind to
+    int lidarPort = 7510;                   // Port sensor sends lidar data to
+    int imuPort = 7513;                     // Port sensor sends IMU data to
     
-    // Use Python UDP bridge to bypass macOS firewall
-    // Required on macOS because unsigned C++ binaries can't receive UDP
-    bool useBridge = true;  // Enabled - Python receives UDP and forwards via Unix socket
-    int bridgePort = 7506;  // Port that the Python bridge forwards to (if useBridge=true)
+    // Bridge mode for macOS firewall bypass
+    bool useBridge = true;
+    int bridgePort = 7506;
     
-    // Transform to apply to all points (sensor -> world frame)
+    // Transform (sensor -> world frame)
     glm::mat4 sensorToWorld = glm::mat4(1.0f);
     
     // Point cloud filtering
-    float minRange = 0.3f;      // Minimum range in meters
-    float maxRange = 50.0f;     // Maximum range in meters
+    float minRange = 0.3f;
+    float maxRange = 50.0f;
     
     // Color mapping
-    bool useIntensityAsColor = true;  // Map signal intensity to grayscale
-    bool useRangeAsColor = false;     // Map range to color gradient
+    bool useIntensityAsColor = true;
+    bool useRangeAsColor = false;
     
     // Downsampling (skip every N points, 1 = no skip)
     int downsampleFactor = 1;
     
-    // Camera ID to assign to all points from this sensor
+    // Camera ID for all points from this sensor
     int32_t cameraId = 0;
     
-    // Live streaming accumulation settings
-    // Accumulate multiple scans to show a complete persistent point cloud
-    int accumulateFrames = 10;  // Number of scans to keep (10 = ~1 second at 10Hz)
-    bool enableAccumulation = true;  // Enable frame accumulation for live streaming
+    // Live streaming accumulation
+    int accumulateFrames = 10;
+    bool enableAccumulation = true;
 };
 
 using PointCloudCallback = std::function<void(const std::vector<PointCloudPoint>& points, double timestamp)>;
 
-// Ouster streaming class
-// Connects to sensor and provides point cloud data in PointCloudPoint format
+// ============================================================================
+// OusterStream - Main streaming class
+// ============================================================================
 class OusterStream {
 public:
     OusterStream();
     ~OusterStream();
     
+    // ========================================================================
+    // Public API
+    // ========================================================================
+    
     // Configuration
     void SetConfig(const OusterConfig& config);
     const OusterConfig& GetConfig() const { return m_config; }
+    OusterConfig& GetConfigMutable() { return m_config; }
     
     // Connection
     bool Connect();
@@ -112,68 +100,152 @@ public:
     void StopStreaming();
     bool IsStreaming() const { return m_streaming; }
     
-    // Load and parse a saved packet file (for debugging)
+    // File loading
     bool LoadPacketFromFile(const std::string& filename);
-    
-    // Load and parse a PCAP file with metadata JSON
     bool LoadPcapFromFile(const std::string& pcapFile, const std::string& metadataFile);
-    
-    // Load metadata from JSON file (for use with live streaming)
-    // This allows faster initialization and offline operation
     bool LoadMetadataFromFile(const std::string& metadataFile);
-    
-    // Clear file-loaded state (used when switching from file mode to live mode)
     void ClearFileLoadedState();
     
+    // Callback and polling
     void SetPointCloudCallback(PointCloudCallback callback) { m_pointCloudCallback = callback; }
-    
     bool PollPointCloud(std::vector<PointCloudPoint>& outPoints, double& outTimestamp);
     
+    // Statistics
     int GetFrameCount() const { return m_frameCount; }
     int GetDroppedFrames() const { return m_droppedFrames; }
     double GetLastTimestamp() const { return m_lastTimestamp; }
     int GetBeamCount() const { return m_beamCount; }
     int GetColumnsPerFrame() const { return m_columnsPerFrame; }
     
-    // Calculate 3D coordinates from lidar measurement (shared by live and file paths)
+    // Point conversion utilities
     PointCloudPoint CalculatePoint3D(uint16_t measurementId, int beam, float range, uint16_t signal,
                                       const std::vector<float>& beamAltitudeAngles,
                                       const std::vector<float>& beamAzimuthAngles);
-    
-    // Convert Ouster point to PointCloudPoint
     PointCloudPoint ConvertPoint(float x, float y, float z, float intensity, float range);
-    
-    // Apply color mapping based on config
     glm::vec3 MapToColor(float intensity, float range);
-    
-    // Flush current frame to callback/queue (called on frame boundary or stream stop)
     void FlushCurrentFrame(uint64_t lastTimestamp, uint32_t minEncoder, uint32_t maxEncoder, bool encoderInitialized);
     
+    // ========================================================================
+    // Internal accessors (for use by helper modules)
+    // ========================================================================
+    
+    // State accessors
+    void SetConnected(bool connected) { m_connected = connected; }
+    void SetStreaming(bool streaming) { m_streaming = streaming; }
+    bool ShouldStop() const { return m_shouldStop; }
+    void SetShouldStop(bool stop) { m_shouldStop = stop; }
+    
+    // Thread management
+    std::unique_ptr<std::thread>& GetStreamThread() { return m_streamThread; }
+    
+    // Point cloud queue access
+    std::mutex& GetPointCloudMutex() { return m_pointCloudMutex; }
+    std::queue<std::pair<std::vector<PointCloudPoint>, double>>& GetPointCloudQueue() { return m_pointCloudQueue; }
+    static constexpr size_t MAX_QUEUE_SIZE = 30;
+    
+    // Accumulated frames access
+    std::deque<std::vector<PointCloudPoint>>& GetAccumulatedFrames() { return m_accumulatedFrames; }
+    void SetAccumulationDirty(bool dirty) { m_accumulationDirty = dirty; }
+    
+    // Current frame buffer
+    std::vector<PointCloudPoint>& GetCurrentFrame() { return m_currentFrame; }
+    
+    // File loading state
+    bool IsPacketLoadedFromFile() const { return m_packetLoadedFromFile; }
+    void SetPacketLoadedFromFile(bool loaded) { m_packetLoadedFromFile = loaded; }
+    std::vector<PointCloudPoint>& GetLoadedPacketPoints() { return m_loadedPacketPoints; }
+    double GetLoadedPacketTimestamp() const { return m_loadedPacketTimestamp; }
+    void SetLoadedPacketTimestamp(double ts) { m_loadedPacketTimestamp = ts; }
+    
+    // Frame state for file/live loading
+    uint16_t GetFileLoadFrameId() const { return m_fileLoadFrameId; }
+    void SetFileLoadFrameId(uint16_t id) { m_fileLoadFrameId = id; }
+    bool IsFileLoadFrameStarted() const { return m_fileLoadFrameStarted; }
+    void SetFileLoadFrameStarted(bool started) { m_fileLoadFrameStarted = started; }
+    uint64_t GetFileLoadLastTimestamp() const { return m_fileLoadLastTimestamp; }
+    void SetFileLoadLastTimestamp(uint64_t ts) { m_fileLoadLastTimestamp = ts; }
+    uint32_t GetFileLoadMinEncoder() const { return m_fileLoadMinEncoder; }
+    void SetFileLoadMinEncoder(uint32_t enc) { m_fileLoadMinEncoder = enc; }
+    uint32_t GetFileLoadMaxEncoder() const { return m_fileLoadMaxEncoder; }
+    void SetFileLoadMaxEncoder(uint32_t enc) { m_fileLoadMaxEncoder = enc; }
+    bool IsFileLoadEncoderInitialized() const { return m_fileLoadEncoderInitialized; }
+    void SetFileLoadEncoderInitialized(bool init) { m_fileLoadEncoderInitialized = init; }
+    
+    // Beam angles
+    std::vector<float>& GetBeamAltitudeAngles() { return m_beamAltitudeAngles; }
+    std::vector<float>& GetBeamAzimuthAngles() { return m_beamAzimuthAngles; }
+    std::vector<int>& GetPixelShiftByRow() { return m_pixelShiftByRow; }
+    
+    // Transforms
+    float* GetBeamToLidarTransform() { return m_beamToLidarTransform; }
+    float GetLidarOriginToBeamOriginMm() const { return m_lidarOriginToBeamOriginMm; }
+    void SetLidarOriginToBeamOriginMm(float val) { m_lidarOriginToBeamOriginMm = val; }
+    float* GetLidarToSensorTransform() { return m_lidarToSensorTransform; }
+    
+    // Packet format
+    const std::string& GetUdpProfileLidar() const { return m_udpProfileLidar; }
+    void SetUdpProfileLidar(const std::string& profile) { m_udpProfileLidar = profile; }
+    int GetColumnsPerPacket() const { return m_columnsPerPacket; }
+    void SetColumnsPerPacket(int cols) { m_columnsPerPacket = cols; }
+    int GetPacketHeaderSize() const { return m_packetHeaderSize; }
+    void SetPacketHeaderSize(int size) { m_packetHeaderSize = size; }
+    int GetMeasurementBlockHeaderSize() const { return m_measurementBlockHeaderSize; }
+    void SetMeasurementBlockHeaderSize(int size) { m_measurementBlockHeaderSize = size; }
+    int GetPixelStride() const { return m_pixelStride; }
+    void SetPixelStride(int stride) { m_pixelStride = stride; }
+    int GetEncoderTicksPerRev() const { return m_encoderTicksPerRev; }
+    void SetEncoderTicksPerRev(int ticks) { m_encoderTicksPerRev = ticks; }
+    float GetRangeUnit() const { return m_rangeUnit; }
+    void SetRangeUnit(float unit) { m_rangeUnit = unit; }
+    void SetBeamCount(int count) { m_beamCount = count; }
+    void SetColumnsPerFrame(int cols) { m_columnsPerFrame = cols; }
+    
+    // Statistics (mutable)
+    void IncrementFrameCount() { m_frameCount++; }
+    void IncrementDroppedFrames() { m_droppedFrames++; }
+    std::atomic<int>& GetDroppedFramesAtomic() { return m_droppedFrames; }
+    void SetLastTimestamp(double ts) { m_lastTimestamp = ts; }
+    std::atomic<uint64_t>& GetLiveLastColumnTimestampNs() { return m_liveLastColumnTimestampNs; }
+    
+    // Callback access
+    PointCloudCallback& GetPointCloudCallback() { return m_pointCloudCallback; }
+
+#ifdef OUSTER_SDK_AVAILABLE
+    // SDK objects
+    std::shared_ptr<ouster::sdk::sensor::SensorScanSource>& GetSdkScanSource() { return m_sdkScanSource; }
+    std::shared_ptr<ouster::sdk::core::SensorInfo>& GetSensorInfo() { return m_sensorInfo; }
+    std::shared_ptr<void>& GetXyzLutPtr() { return m_xyzlut_ptr; }
+    bool IsSdkStreamingInitialized() const { return m_sdkStreamingInitialized; }
+    void SetSdkStreamingInitialized(bool init) { m_sdkStreamingInitialized = init; }
+#endif
+
 private:
     void StreamingThread();
     void ProcessLidarPacket(const uint8_t* data, size_t size);
-    
+    bool ParseMetadataFile(const std::string& metadataFile);
+    void ProcessLidarPacketFromFile(const uint8_t* data, size_t size);
+
 private:
     OusterConfig m_config;
     
+    // Connection state
     std::atomic<bool> m_connected{false};
     std::atomic<bool> m_streaming{false};
     std::atomic<bool> m_shouldStop{false};
-    
     std::unique_ptr<std::thread> m_streamThread;
     
+    // Callback
     PointCloudCallback m_pointCloudCallback;
     
+    // Point cloud queue
     std::mutex m_pointCloudMutex;
     std::queue<std::pair<std::vector<PointCloudPoint>, double>> m_pointCloudQueue;
-    static constexpr size_t MAX_QUEUE_SIZE = 10;
     
-    // Accumulated point cloud for live streaming persistence
-    // Ring buffer of recent frames, merged into single output
+    // Accumulated frames
     std::deque<std::vector<PointCloudPoint>> m_accumulatedFrames;
-    std::vector<PointCloudPoint> m_accumulatedPointCloud;  // Merged result
-    bool m_accumulationDirty = false;  // Need to rebuild merged result
-    std::chrono::steady_clock::time_point m_lastAccumulationRebuildTime;  // For stale detection
+    std::vector<PointCloudPoint> m_accumulatedPointCloud;
+    bool m_accumulationDirty = false;
+    std::chrono::steady_clock::time_point m_lastAccumulationRebuildTime;
     
     // Statistics
     std::atomic<int> m_frameCount{0};
@@ -182,18 +254,18 @@ private:
     std::atomic<uint64_t> m_liveLastColumnTimestampNs{0};
     
     // Sensor metadata
-    int m_beamCount = 128;  // OS0-128
+    int m_beamCount = 128;
     int m_columnsPerFrame = 1024;
     
-    // Internal buffer
+    // Current frame buffer
     std::vector<PointCloudPoint> m_currentFrame;
     
-    // For loaded packet files: aggregate all frames into one persistent frame
+    // File loading state
     bool m_packetLoadedFromFile{false};
     std::vector<PointCloudPoint> m_loadedPacketPoints;
     double m_loadedPacketTimestamp{0.0};
     
-    // Frame state for file loading (non-thread_local)
+    // Frame state
     uint16_t m_fileLoadFrameId{0};
     bool m_fileLoadFrameStarted{false};
     uint64_t m_fileLoadLastTimestamp{0};
@@ -201,64 +273,29 @@ private:
     uint32_t m_fileLoadMaxEncoder{0};
     bool m_fileLoadEncoderInitialized{false};
     
-    // Beam angles from metadata
+    // Beam angles
     std::vector<float> m_beamAltitudeAngles;
     std::vector<float> m_beamAzimuthAngles;
+    std::vector<int> m_pixelShiftByRow;
     
-    // Pixel shift for destaggering (essential for LEGACY profile)
-    std::vector<int> m_pixelShiftByRow;  // Shift values for each beam/row
+    // Transforms
+    float m_beamToLidarTransform[16];
+    float m_lidarOriginToBeamOriginMm = 0.0f;
+    float m_lidarToSensorTransform[16];
     
-    // Beam-to-lidar transform (for accurate coordinate calculation)
-    float m_beamToLidarTransform[16];  // 4x4 matrix in row-major order
-    float m_lidarOriginToBeamOriginMm = 0.0f;  // Distance in mm
-    
-    // Lidar-to-sensor transform (for sensor frame coordinates)
-    float m_lidarToSensorTransform[16];  // 4x4 matrix in row-major order
-    
-    // Packet format from metadata
-    std::string m_udpProfileLidar;  // "LEGACY", "RNG19_RFL8_SIG16_NIR16", etc.
+    // Packet format
+    std::string m_udpProfileLidar;
     int m_columnsPerPacket = 16;
-    int m_packetHeaderSize = 0;  // Packet-level header size (0 for LEGACY)
-    int m_measurementBlockHeaderSize = 4;  // Status field size per measurement block
-    int m_pixelStride = 12;  // Bytes per pixel (depends on profile)
-    int m_encoderTicksPerRev = 90112;  // Default, should be read from metadata
-    float m_rangeUnit = 0.001f;  // Range unit in meters per count (from metadata, default 0.001)
-    
-    // Helper to parse metadata JSON and extract beam angles, packet format, etc.
-    bool ParseMetadataFile(const std::string& metadataFile);
-    
-    // Process lidar packet when loading from file (uses member variables)
-    void ProcessLidarPacketFromFile(const uint8_t* data, size_t size);
-    
-    // Make manual parsing functions friends so they can access private members
-    friend bool LoadPcapFromFileManual(OusterStream* stream, const std::string& pcapFile, const std::string& metadataFile);
-    friend void ProcessLidarPacketFromFileManual(OusterStream* stream, const uint8_t* data, size_t size);
-    friend void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t size);
-    
-    // Make file loader functions friends so they can access private members
-    // Forward declarations are outside the class (before class definition)
-    friend bool OusterFileLoader::LoadMetadataFromFile(OusterStream* stream, const std::string& metadataFile);
-    friend bool OusterFileLoader::LoadPcapFromFile(OusterStream* stream, const std::string& pcapFile, const std::string& metadataFile);
-    friend bool OusterFileLoader::LoadPacketFromFile(OusterStream* stream, const std::string& filename);
-    friend bool OusterFileLoader::ParseMetadataFileImpl(OusterStream* stream, const std::string& metadataFile);
-    friend void OusterFileLoader::ProcessLidarPacketFromFileImpl(OusterStream* stream, const uint8_t* data, size_t size);
-    
-    // Make live streaming functions friends so they can access private members
-    // Forward declarations are outside the class (before class definition)
-    friend bool OusterLiveStreaming::Connect(OusterStream* stream);
-    friend void OusterLiveStreaming::Disconnect(OusterStream* stream);
-    friend void OusterLiveStreaming::StartStreaming(OusterStream* stream);
-    friend void OusterLiveStreaming::StopStreaming(OusterStream* stream);
-    friend void OusterLiveStreaming::StreamingThreadImpl(OusterStream* stream);
-    friend void OusterLiveStreaming::ProcessLidarPacketImpl(OusterStream* stream, const uint8_t* data, size_t size);
-    
+    int m_packetHeaderSize = 0;
+    int m_measurementBlockHeaderSize = 4;
+    int m_pixelStride = 12;
+    int m_encoderTicksPerRev = 90112;
+    float m_rangeUnit = 0.001f;
+
 #ifdef OUSTER_SDK_AVAILABLE
-    // SDK objects for live streaming
     std::shared_ptr<ouster::sdk::sensor::SensorScanSource> m_sdkScanSource;
     std::shared_ptr<ouster::sdk::core::SensorInfo> m_sensorInfo;
-    // XYZLut is a typedef, so we need to include the header to use it
-    // We'll use a type alias in the .cpp file
-    std::shared_ptr<void> m_xyzlut_ptr;  // Will be cast to std::shared_ptr<XYZLut> in .cpp
+    std::shared_ptr<void> m_xyzlut_ptr;
     bool m_sdkStreamingInitialized{false};
 #endif
 };

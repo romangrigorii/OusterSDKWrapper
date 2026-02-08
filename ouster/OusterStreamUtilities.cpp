@@ -1,3 +1,7 @@
+// ============================================================================
+// OusterStreamUtilities.cpp - Port management utilities
+// ============================================================================
+
 #include "OusterStreamUtilities.h"
 #include "platform/Logger.h"
 #include <unistd.h>
@@ -5,12 +9,7 @@
 #include <cstring>
 #include <vector>
 #include <thread>
-#ifdef __APPLE__
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <chrono>
-#endif
 
 namespace Engine {
 namespace Editors {
