@@ -4,11 +4,15 @@
 
 #include "OusterStreamLiveStreaming.h"
 #include "OusterStream.h"
+#include "OusterStreamFileLoader.h"
 #include "OusterStreamUtilities.h"
 #include "OusterStreamCommon.h"
+#include "OusterLogging.h"
 #include "platform/Logger.h"
 #include <filesystem>
 #include <string>
+#include <cstdio>
+#include <array>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -87,6 +91,29 @@ static std::string GetSocketErrorString() {
 }
 #endif
 
+// Fetch sensor metadata JSON from sensor HTTP API (for Direct UDP when no metadata file loaded).
+static std::string FetchMetadataFromSensor(const std::string& hostname) {
+    std::string url = "http://" + hostname + "/api/v1/sensor/metadata/sensor_info";
+    std::string result;
+#ifdef _WIN32
+    std::string cmd = "curl -s --max-time 5 \"" + url + "\" 2>nul";
+    FILE* fp = _popen(cmd.c_str(), "rt");
+#else
+    std::string cmd = "curl -s --max-time 5 '" + url + "' 2>/dev/null";
+    FILE* fp = popen(cmd.c_str(), "r");
+#endif
+    if (!fp) return result;
+    std::array<char, 4096> buf{};
+    while (fgets(buf.data(), static_cast<int>(buf.size()), fp) != nullptr)
+        result += buf.data();
+#ifdef _WIN32
+    _pclose(fp);
+#else
+    pclose(fp);
+#endif
+    return result;
+}
+
 static bool EnsurePortsFree(int lidarPort, int imuPort) {
     bool lidarFree = OusterUtilities::KillProcessesOnPort(lidarPort);
     bool imuFree = OusterUtilities::KillProcessesOnPort(imuPort);
@@ -134,19 +161,11 @@ static void ProcessScanToPointCloud(OusterStream* stream, const LidarScan& scan,
             float intensity = 0.0f;
             if (hasSignal) {
                 auto signalField = scan.field<uint16_t>(ChanField::SIGNAL);
-                intensity = static_cast<float>(signalField(row, col));
+                intensity = std::max(static_cast<float>(signalField(row, col)) / 65535.0f, 0.1f);
             }
-            
-            PointCloudPoint point;
-            // Use meters to match Python/SDK (xyzlut returns meters; browser viewer uses meters)
-            point.position = glm::vec3(
-                static_cast<float>(x),
-                static_cast<float>(y),
-                static_cast<float>(z)
-            );
-            point.color = stream->MapToColor(intensity, static_cast<float>(rangeM));
-            point.cameraId = config.cameraId;
-            
+            PointCloudPoint point = stream->ConvertPoint(
+                static_cast<float>(x), static_cast<float>(y), static_cast<float>(z),
+                intensity, static_cast<float>(rangeM));
             outPoints.push_back(point);
         }
     }
@@ -254,10 +273,14 @@ void StartStreaming(OusterStream* stream) {
         thread.reset();
     }
     
+    // Clear previous run's points so we don't accumulate across sessions
+    stream->ClearFileLoadedState();
+    
     // Reset state
     stream->SetShouldStop(false);
     stream->SetStreaming(true);
     stream->GetLiveLastColumnTimestampNs().store(0);
+    stream->ResetPacketsInCurrentScan();
     
     // Create streaming thread
     try {
@@ -378,9 +401,9 @@ void StreamingThreadImpl(OusterStream* stream) {
                 std::this_thread::sleep_for(std::chrono::seconds(2));
             }
             
-            // Check sensor connectivity
-            LOG_INFO_FMT("OusterLiveStreaming", "Checking sensor at %s...", config.hostname.c_str());
-            
+            if (Engine::Editors::CameraSystem::IsOusterVerbose()) {
+                LOG_INFO_FMT("OusterLiveStreaming", "Checking sensor at %s...", config.hostname.c_str());
+            }
             if (!CheckSensorConnectivity(config.hostname)) {
                 if (stream->GetSensorInfo() && stream->GetXyzLutPtr()) {
                     LOG_WARNING("OusterLiveStreaming", "Sensor unreachable but have pre-loaded metadata");
@@ -388,12 +411,12 @@ void StreamingThreadImpl(OusterStream* stream) {
                     LOG_ERROR("OusterLiveStreaming", "Sensor unreachable and no metadata - load metadata first");
                     throw std::runtime_error("Sensor unreachable");
                 }
-            } else {
+            } else if (Engine::Editors::CameraSystem::IsOusterVerbose()) {
                 LOG_INFO("OusterLiveStreaming", "Sensor is reachable");
             }
-            
-            // Initialize SDK with retries
-            LOG_INFO("OusterLiveStreaming", "Creating SensorScanSource...");
+            if (Engine::Editors::CameraSystem::IsOusterVerbose()) {
+                LOG_INFO("OusterLiveStreaming", "Creating SensorScanSource...");
+            }
             
             for (int retry = 0; retry < 3 && !stream->ShouldStop(); retry++) {
                 if (retry > 0) {
@@ -414,7 +437,9 @@ void StreamingThreadImpl(OusterStream* stream) {
                             opts.config_timeout = 20.0f;
                         }
                     );
-                    LOG_INFO("OusterLiveStreaming", "SensorScanSource created");
+                    if (Engine::Editors::CameraSystem::IsOusterVerbose()) {
+                        LOG_INFO("OusterLiveStreaming", "SensorScanSource created");
+                    }
                     break;
                 } catch (const std::exception& e) {
                     LOG_ERROR_FMT("OusterLiveStreaming", "SDK init failed: %s", e.what());
@@ -439,9 +464,11 @@ void StreamingThreadImpl(OusterStream* stream) {
             }
             
             stream->SetSdkStreamingInitialized(true);
-            LOG_INFO_FMT("OusterLiveStreaming", "SDK initialized: SN=%llu", 
-                        static_cast<unsigned long long>(stream->GetSensorInfo()->sn));
-            
+            LOG_INFO("OusterLiveStreaming", "Ouster: using Ouster SDK scan source (live)");
+            if (Engine::Editors::CameraSystem::IsOusterVerbose()) {
+                LOG_INFO_FMT("OusterLiveStreaming", "SDK initialized: SN=%llu",
+                            static_cast<unsigned long long>(stream->GetSensorInfo()->sn));
+            }
             // Stream scans
             auto xyzlut = std::static_pointer_cast<XYZLut>(stream->GetXyzLutPtr());
             auto scanIt = stream->GetSdkScanSource()->begin(0);
@@ -463,10 +490,9 @@ void StreamingThreadImpl(OusterStream* stream) {
                     if (!scanPtr) continue;
                     
                     scanCount++;
-                    if (scanCount % 10 == 0) {
+                    if (Engine::Editors::CameraSystem::IsOusterVerbose() && scanCount % 10 == 0) {
                         LOG_INFO_FMT("OusterLiveStreaming", "Scan %d via SDK", scanCount);
                     }
-                    
                     std::vector<PointCloudPoint> points;
                     ProcessScanToPointCloud(stream, *scanPtr, xyzlut, points);
                     
@@ -530,7 +556,7 @@ void StreamingThreadImpl(OusterStream* stream) {
 #ifdef OUSTER_SDK_AVAILABLE
             // Hybrid mode with SDK parsing
             if (stream->GetSensorInfo()) {
-                LOG_INFO("OusterLiveStreaming", "Hybrid mode with SDK parsing");
+                LOG_INFO("OusterLiveStreaming", "Ouster: using bridge + SDK parsing");
                 
                 auto packetFormat = std::make_shared<PacketFormat>(*stream->GetSensorInfo());
                 ScanBatcher batcher(stream->GetSensorInfo());
@@ -562,7 +588,7 @@ void StreamingThreadImpl(OusterStream* stream) {
                     if (!readExact(buffer.data(), length)) break;
                     
                     totalPackets++;
-                    if (totalPackets % 100 == 0) {
+                    if (Engine::Editors::CameraSystem::IsOusterVerbose() && totalPackets % 100 == 0) {
                         LOG_INFO_FMT("OusterLiveStreaming", "Hybrid: packet %d, size=%u", totalPackets, length);
                     }
                     
@@ -583,7 +609,7 @@ void StreamingThreadImpl(OusterStream* stream) {
                         double timestamp = std::chrono::duration<double>(
                             std::chrono::system_clock::now().time_since_epoch()).count();
                         
-                        if (!points.empty() && (totalScans == 1 || totalScans % 10 == 0)) {
+                        if (Engine::Editors::CameraSystem::IsOusterVerbose() && !points.empty() && (totalScans == 1 || totalScans % 10 == 0)) {
                             LOG_INFO_FMT("OusterLiveStreaming", "Hybrid scan %d: %zu pts", totalScans, points.size());
                         }
                         
@@ -599,7 +625,7 @@ void StreamingThreadImpl(OusterStream* stream) {
             }
 #endif
             // Fallback: manual parsing
-            LOG_WARNING("OusterLiveStreaming", "No SDK metadata - using manual parsing");
+            LOG_INFO("OusterLiveStreaming", "Ouster: using bridge + manual packet parsing");
             
             std::vector<uint8_t> buffer(65536);
             struct pollfd pfd = {sock, POLLIN, 0};
@@ -634,7 +660,19 @@ void StreamingThreadImpl(OusterStream* stream) {
 #endif  // !_WIN32
         
         // Direct UDP mode (may not work on macOS due to firewall)
-        LOG_INFO("OusterLiveStreaming", "Direct UDP mode");
+        // If no metadata/XYZ LUT yet, try to fetch from sensor so we use SDK XYZ LUT path instead of beam-angle path
+#ifdef OUSTER_SDK_AVAILABLE
+        if (!stream->GetXyzLutPtr()) {
+            LOG_INFO("OusterLiveStreaming", "No metadata loaded - fetching from sensor for SDK parsing...");
+            std::string metadataJson = FetchMetadataFromSensor(config.hostname);
+            if (!metadataJson.empty() && OusterFileLoader::LoadMetadataFromJsonString(stream, metadataJson)) {
+                LOG_INFO("OusterLiveStreaming", "Metadata fetched from sensor - will use SDK XYZ LUT path");
+            } else {
+                LOG_WARNING("OusterLiveStreaming", "Could not fetch metadata from sensor - will use manual beam-angle path. Load a metadata file before enabling Lidar Live for SDK XYZ LUT parsing.");
+            }
+        }
+#endif
+        LOG_INFO("OusterLiveStreaming", "Ouster: using direct UDP + manual packet parsing");
         
 #ifdef _WIN32
         SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);

@@ -16,6 +16,7 @@
 #include <queue>
 #include <deque>
 #include <chrono>
+#include <cstdint>
 
 // Forward declarations for Ouster SDK types
 namespace ouster {
@@ -66,9 +67,9 @@ struct OusterConfig {
     // Camera ID for all points from this sensor
     int32_t cameraId = 0;
     
-    // Live streaming accumulation
+    // Live streaming: when true, display = merge of last accumulateFrames scans; when false, display = latest scan only (refresh each scan)
     int accumulateFrames = 10;
-    bool enableAccumulation = true;
+    bool enableAccumulation = false;
 };
 
 using PointCloudCallback = std::function<void(const std::vector<PointCloudPoint>& points, double timestamp)>;
@@ -117,7 +118,7 @@ public:
     int GetBeamCount() const { return m_beamCount; }
     int GetColumnsPerFrame() const { return m_columnsPerFrame; }
     
-    // Point conversion utilities
+    // Point conversion utilities (match SDK xyzlut: encoder from column index only, no encoder count / no pixel_shift in LUT)
     PointCloudPoint CalculatePoint3D(uint16_t measurementId, int beam, float range, uint16_t signal,
                                       const std::vector<float>& beamAltitudeAngles,
                                       const std::vector<float>& beamAzimuthAngles);
@@ -170,6 +171,16 @@ public:
     void SetFileLoadMaxEncoder(uint32_t enc) { m_fileLoadMaxEncoder = enc; }
     bool IsFileLoadEncoderInitialized() const { return m_fileLoadEncoderInitialized; }
     void SetFileLoadEncoderInitialized(bool init) { m_fileLoadEncoderInitialized = init; }
+    int GetPacketsInCurrentScan() const { return m_packetsInCurrentScan; }
+    void AddPacketsInCurrentScan(int n = 1) { m_packetsInCurrentScan += n; }
+    void ResetPacketsInCurrentScan() { m_packetsInCurrentScan = 0; }
+    // Match SDK lidar_packets_per_frame(): ceiling(columns_per_frame / columns_per_packet) for default column_window
+    int ExpectedPacketsPerScan() const { return (m_columnsPerPacket > 0) ? static_cast<int>((static_cast<size_t>(m_columnsPerFrame) + m_columnsPerPacket - 1) / m_columnsPerPacket) : 64; }
+    
+    // Manual path: range/signal images for SDK XYZLut path (row-major, index = beam * w + measurement_id)
+    std::vector<uint32_t>& GetManualRangeImage() { return m_manualRangeImage; }
+    std::vector<uint16_t>& GetManualSignalImage() { return m_manualSignalImage; }
+    void ClearManualRangeImage();
     
     // Beam angles
     std::vector<float>& GetBeamAltitudeAngles() { return m_beamAltitudeAngles; }
@@ -272,6 +283,12 @@ private:
     uint32_t m_fileLoadMinEncoder{0};
     uint32_t m_fileLoadMaxEncoder{0};
     bool m_fileLoadEncoderInitialized{false};
+    // Scan batching (match SDK: flush only after expected_lidar_packets per scan)
+    int m_packetsInCurrentScan{0};
+    
+    // Manual path: full-scan range/signal images for SDK XYZLut (w * h, row-major)
+    std::vector<uint32_t> m_manualRangeImage;
+    std::vector<uint16_t> m_manualSignalImage;
     
     // Beam angles
     std::vector<float> m_beamAltitudeAngles;

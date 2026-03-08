@@ -4,6 +4,7 @@
 
 #include "OusterStream.h"
 #include "OusterStreamCommon.h"
+#include "OusterLogging.h"
 #include "platform/Logger.h"
 #ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
@@ -169,6 +170,7 @@ void OusterStream::ClearFileLoadedState() {
     m_packetLoadedFromFile = false;
     m_loadedPacketPoints.clear();
     m_loadedPacketTimestamp = 0.0;
+    m_packetsInCurrentScan = 0;
     
     {
         std::lock_guard<std::mutex> lock(m_pointCloudMutex);
@@ -190,39 +192,32 @@ void OusterStream::ClearFileLoadedState() {
 PointCloudPoint OusterStream::CalculatePoint3D(uint16_t measurementId, int beam, float range, uint16_t signal,
                                                 const std::vector<float>& beamAltitudeAngles,
                                                 const std::vector<float>& beamAzimuthAngles) {
-    // Match SDK xyzlut: encoder from column, azimuth/altitude from beam angles (degrees -> radians)
-    int columnIndex = static_cast<int>(measurementId);
-    int shift = (!m_pixelShiftByRow.empty() && beam < static_cast<int>(m_pixelShiftByRow.size()))
-                ? m_pixelShiftByRow[beam] : 0;
-    int correctedColumn = (columnIndex + shift + m_columnsPerFrame) % m_columnsPerFrame;
-    float theta_encoder = 2.0f * static_cast<float>(M_PI) - (static_cast<float>(correctedColumn) * 2.0f * static_cast<float>(M_PI) / static_cast<float>(m_columnsPerFrame));
-    float theta_azimuth = -(beamAzimuthAngles[beam] * static_cast<float>(M_PI) / 180.0f);
-    float altitude_rad = beamAltitudeAngles[beam] * static_cast<float>(M_PI) / 180.0f;
-    // Unit direction (same as SDK direction columns before range_unit scale)
-    float dir_x = cosf(theta_encoder + theta_azimuth) * cosf(altitude_rad);
-    float dir_y = sinf(theta_encoder + theta_azimuth) * cosf(altitude_rad);
-    float dir_z = sinf(altitude_rad);
-    // Beam origin offset (SDK: beam_to_lidar (0,3) and (2,3) in mm, D = euclidean distance)
-    float Bx = m_beamToLidarTransform[3];
-    float Bz = m_beamToLidarTransform[11];
-    float D = sqrtf(Bx * Bx + Bz * Bz);
-    float off_x = cosf(theta_encoder) * Bx - dir_x * D;
-    float off_y = sinf(theta_encoder) * Bx - dir_y * D;
-    float off_z = -dir_z * D + Bz;
-    // point_lidar in mm = range_m * 1000 * direction + offset_mm (SDK uses range_counts * range_unit * dir + offset*range_unit -> meters)
-    float range_mm = range * 1000.0f;
-    float x_lidar = range_mm * dir_x + off_x;
-    float y_lidar = range_mm * dir_y + off_y;
-    float z_lidar = range_mm * dir_z + off_z;
-    // Apply lidar-to-sensor transform (lidar frame in mm)
-    float x_sensor_mm = m_lidarToSensorTransform[0] * x_lidar + m_lidarToSensorTransform[1] * y_lidar + m_lidarToSensorTransform[2] * z_lidar + m_lidarToSensorTransform[3];
-    float y_sensor_mm = m_lidarToSensorTransform[4] * x_lidar + m_lidarToSensorTransform[5] * y_lidar + m_lidarToSensorTransform[6] * z_lidar + m_lidarToSensorTransform[7];
-    float z_sensor_mm = m_lidarToSensorTransform[8] * x_lidar + m_lidarToSensorTransform[9] * y_lidar + m_lidarToSensorTransform[10] * z_lidar + m_lidarToSensorTransform[11];
-    
-    // Output in meters to match Python/SDK (setup_ouster.py and xyzlut use meters; browser receives meters)
-    float x = x_sensor_mm / 1000.0f;
-    float y = y_sensor_mm / 1000.0f;
-    float z = z_sensor_mm / 1000.0f;
+    // Ouster reference: xyz_proj_beam_to_sensor_transform (ouster.sdk.examples.reference)
+    // and Sensor Data docs: theta_encoder = 2*pi*(1 - v/w), theta_azimuth = -2*pi*beam_azimuth/360, phi = 2*pi*beam_altitude/360
+    // Lidar frame: x = (r-n)*cos(θe+θa)*cos(φ) + Bx*cos(θe), y = (r-n)*sin(θe+θa)*cos(φ) + Bx*sin(θe), z = (r-n)*sin(φ) + Bz
+    // n = distance lidar origin to beam origin = sqrt(beam_to_lidar[0,3]^2 + beam_to_lidar[2,3]^2). r, Bx, Bz in mm.
+    int v = static_cast<int>(measurementId) % m_columnsPerFrame;
+    if (v < 0) v += m_columnsPerFrame;
+    int u = beam;
+    float theta_encoder = 2.0f * static_cast<float>(M_PI) * (1.0f - static_cast<float>(v) / static_cast<float>(m_columnsPerFrame));
+    float theta_azimuth = -2.0f * static_cast<float>(M_PI) * (beamAzimuthAngles[u] / 360.0f);
+    float phi = 2.0f * static_cast<float>(M_PI) * (beamAltitudeAngles[u] / 360.0f);
+    float Bx_mm = m_beamToLidarTransform[3];
+    float Bz_mm = m_beamToLidarTransform[11];
+    float n_mm = sqrtf(Bx_mm * Bx_mm + Bz_mm * Bz_mm);
+    float r_mm = range * 1000.0f;  // range from sensor is in mm (RANGE field)
+    float r_minus_n = r_mm - n_mm;
+    // Lidar frame (mm), then transform to sensor frame, then mm -> m
+    float x_lidar_mm = r_minus_n * cosf(theta_encoder + theta_azimuth) * cosf(phi) + Bx_mm * cosf(theta_encoder);
+    float y_lidar_mm = r_minus_n * sinf(theta_encoder + theta_azimuth) * cosf(phi) + Bx_mm * sinf(theta_encoder);
+    float z_lidar_mm = r_minus_n * sinf(phi) + Bz_mm;
+    // lidar_to_sensor: row-major 4x4, point_sensor = T * point_lidar (column). Doc: "homogeneous transformation matrix in row-major ordering"
+    float x_sensor_mm = m_lidarToSensorTransform[0] * x_lidar_mm + m_lidarToSensorTransform[1] * y_lidar_mm + m_lidarToSensorTransform[2] * z_lidar_mm + m_lidarToSensorTransform[3];
+    float y_sensor_mm = m_lidarToSensorTransform[4] * x_lidar_mm + m_lidarToSensorTransform[5] * y_lidar_mm + m_lidarToSensorTransform[6] * z_lidar_mm + m_lidarToSensorTransform[7];
+    float z_sensor_mm = m_lidarToSensorTransform[8] * x_lidar_mm + m_lidarToSensorTransform[9] * y_lidar_mm + m_lidarToSensorTransform[10] * z_lidar_mm + m_lidarToSensorTransform[11];
+    float x = x_sensor_mm * 0.001f;
+    float y = y_sensor_mm * 0.001f;
+    float z = z_sensor_mm * 0.001f;
     
     float intensity = std::max(static_cast<float>(signal) / 65535.0f, 0.1f);
     
@@ -255,6 +250,15 @@ glm::vec3 OusterStream::MapToColor(float intensity, float range) {
     }
 }
 
+void OusterStream::ClearManualRangeImage() {
+    const size_t n = static_cast<size_t>(m_beamCount) * static_cast<size_t>(m_columnsPerFrame);
+    m_manualRangeImage.resize(n, 0);
+    m_manualSignalImage.resize(n, 0);
+}
+
+// One Ouster "scan" = one full rotation = one complete frame (all columns). We flush when we have a full scan.
+// Display buffer: if enableAccumulation we keep last accumulateFrames scans (rolling merge); else we push
+// this scan to the queue and PollPointCloud returns the latest scan only (refresh per scan).
 void OusterStream::FlushCurrentFrame(uint64_t lastTimestamp, uint32_t minEncoder, uint32_t maxEncoder, bool encoderInitialized) {
     if (m_currentFrame.empty()) return;
     
@@ -262,13 +266,18 @@ void OusterStream::FlushCurrentFrame(uint64_t lastTimestamp, uint32_t minEncoder
     m_lastTimestamp = timestamp;
     m_frameCount++;
     
-    if (encoderInitialized) {
-        uint32_t encoderSpan = (maxEncoder - minEncoder) % m_encoderTicksPerRev;
-        LOG_INFO_FMT("OusterStream", "Frame %d: %zu points, encoder span: %u/%u (%.1f%%)", 
-                     m_frameCount.load(), m_currentFrame.size(), 
-                     encoderSpan, m_encoderTicksPerRev, (encoderSpan * 100.0f / static_cast<float>(m_encoderTicksPerRev)));
-    } else {
-        LOG_INFO_FMT("OusterStream", "Frame %d: %zu points", m_frameCount.load(), m_currentFrame.size());
+    const bool verbose = Engine::Editors::CameraSystem::IsOusterVerbose();
+    if (verbose) {
+        if (encoderInitialized) {
+            uint32_t encoderSpan = (maxEncoder - minEncoder) % m_encoderTicksPerRev;
+            LOG_INFO_FMT("OusterStream", "Frame %d: %zu points, encoder span: %u/%u (%.1f%%)",
+                         m_frameCount.load(), m_currentFrame.size(),
+                         encoderSpan, m_encoderTicksPerRev, (encoderSpan * 100.0f / static_cast<float>(m_encoderTicksPerRev)));
+        } else {
+            LOG_INFO_FMT("OusterStream", "Frame %d: %zu points", m_frameCount.load(), m_currentFrame.size());
+        }
+    } else if (m_frameCount % 60 == 0) {
+        LOG_INFO_FMT("OusterStream", "Ouster: frame %d, %zu points", m_frameCount.load(), m_currentFrame.size());
     }
     
     if (m_pointCloudCallback) {
@@ -345,7 +354,7 @@ bool OusterStream::PollPointCloud(std::vector<PointCloudPoint>& outPoints, doubl
                 warnedStale = false;
             }
             
-            if (pollCount % 30 == 0) {
+            if (Engine::Editors::CameraSystem::IsOusterVerbose() && pollCount % 30 == 0) {
                 LOG_INFO_FMT("OusterStream", "Poll: %zu accumulated points from %zu frames", outPoints.size(), m_accumulatedFrames.size());
             }
             return true;
@@ -357,7 +366,7 @@ bool OusterStream::PollPointCloud(std::vector<PointCloudPoint>& outPoints, doubl
     pollCount++;
     
     if (m_pointCloudQueue.empty()) {
-        if (pollCount % 60 == 0) {
+        if (Engine::Editors::CameraSystem::IsOusterVerbose() && pollCount % 60 == 0) {
             LOG_INFO_FMT("OusterStream", "Poll #%d: queue empty", pollCount);
         }
         return false;
@@ -375,7 +384,7 @@ bool OusterStream::PollPointCloud(std::vector<PointCloudPoint>& outPoints, doubl
     outTimestamp = latest.second;
     m_pointCloudQueue.pop();
     
-    if (pollCount <= 5 || pollCount % 30 == 0 || skippedScans > 0) {
+    if (Engine::Editors::CameraSystem::IsOusterVerbose() && (pollCount <= 5 || pollCount % 30 == 0 || skippedScans > 0)) {
         LOG_INFO_FMT("OusterStream", "Poll #%d: %zu points (skipped %zu)", pollCount, outPoints.size(), skippedScans);
     }
     return true;

@@ -5,6 +5,7 @@
 #include "OusterStreamFileLoader.h"
 #include "OusterStream.h"
 #include "OusterStreamCommon.h"
+#include "OusterLogging.h"
 #include "platform/Logger.h"
 #include <filesystem>
 #include <fstream>
@@ -131,7 +132,54 @@ bool LoadMetadataFromFile(OusterStream* stream, const std::string& metadataFile)
         return false;
     }
 #else
-    LOG_ERROR("OusterFileLoader", "Ouster SDK not available");
+    // SDK not available: parse metadata JSON manually so beam angles, columns_per_frame, etc. work with manual parser
+    std::string actualPath = FindFile(metadataFile);
+    if (!std::filesystem::exists(actualPath) || !std::filesystem::is_regular_file(actualPath)) {
+        LOG_ERROR_FMT("OusterFileLoader", "Metadata file not found: %s", metadataFile.c_str());
+        return false;
+    }
+    LOG_INFO_FMT("OusterFileLoader", "Loading metadata (no SDK): %s", actualPath.c_str());
+    bool ok = ParseMetadataFileImpl(stream, actualPath);
+    if (ok) {
+        LOG_INFO("OusterFileLoader", "Metadata parsed successfully for manual parsing");
+    } else {
+        LOG_ERROR("OusterFileLoader", "Failed to parse metadata JSON");
+    }
+    return ok;
+#endif
+}
+
+// ============================================================================
+// LoadMetadataFromJsonString - For metadata fetched from sensor HTTP API
+// ============================================================================
+
+bool LoadMetadataFromJsonString(OusterStream* stream, const std::string& metadataJson) {
+    if (!stream) {
+        LOG_ERROR("OusterFileLoader", "Stream is null");
+        return false;
+    }
+    if (metadataJson.empty()) {
+        LOG_ERROR("OusterFileLoader", "Metadata JSON string is empty");
+        return false;
+    }
+#ifdef OUSTER_SDK_AVAILABLE
+    try {
+        SensorInfo sensorInfoObj(metadataJson);
+        stream->GetSensorInfo() = std::make_shared<SensorInfo>(sensorInfoObj);
+        LOG_INFO_FMT("OusterFileLoader", "Metadata from sensor: %s (SN: %llu)",
+                    stream->GetSensorInfo()->prod_line.c_str(),
+                    static_cast<unsigned long long>(stream->GetSensorInfo()->sn));
+        auto xyzlut = std::make_shared<XYZLut>(*stream->GetSensorInfo(), false);
+        stream->GetXyzLutPtr() = std::static_pointer_cast<void>(xyzlut);
+        LOG_INFO("OusterFileLoader", "XYZ lookup table created from sensor metadata");
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR_FMT("OusterFileLoader", "Failed to parse metadata from sensor: %s", e.what());
+        return false;
+    }
+#else
+    (void)metadataJson;
+    LOG_WARNING("OusterFileLoader", "SDK not available - cannot create XYZ LUT from JSON string");
     return false;
 #endif
 }
@@ -145,7 +193,7 @@ bool LoadPcapFromFile(OusterStream* stream, const std::string& pcapFile, const s
         LOG_ERROR("OusterFileLoader", "Stream is null");
         return false;
     }
-    
+    stream->ClearFileLoadedState();
 #ifdef __APPLE__
     LOG_INFO_FMT("OusterFileLoader", "Loading PCAP: %s with metadata: %s", pcapFile.c_str(), metadataFile.c_str());
     
@@ -171,7 +219,10 @@ bool LoadPcapFromFile(OusterStream* stream, const std::string& pcapFile, const s
         opts.index = false;
         opts.soft_id_check = true;
         
-        LOG_INFO("OusterFileLoader", "Creating PcapScanSource...");
+        LOG_INFO("OusterFileLoader", "Ouster: loading PCAP with Ouster SDK");
+        if (Engine::Editors::CameraSystem::IsOusterVerbose()) {
+            LOG_INFO("OusterFileLoader", "Creating PcapScanSource...");
+        }
         PcapScanSource scanSource(actualPcapPath, [&opts](PcapScanSourceOptions& o) { o = opts; });
         
         const auto& sensorInfos = scanSource.sensor_info();
@@ -252,29 +303,22 @@ bool LoadPcapFromFile(OusterStream* stream, const std::string& pcapFile, const s
                             auto signals = scan.field<uint16_t>(ChanField::SIGNAL);
                             signal = signals(row, col);
                         }
-                        
-                        PointCloudPoint point;
-                        // Use meters to match Python/SDK (xyzlut returns meters)
-                        point.position = glm::vec3(
-                            static_cast<float>(x),
-                            static_cast<float>(y),
-                            static_cast<float>(z)
-                        );
-                        point.cameraId = config.cameraId;
-                        point.color = stream->MapToColor(static_cast<float>(signal), static_cast<float>(rangeM));
-                        
+                        float intensity = std::max(static_cast<float>(signal) / 65535.0f, 0.1f);
+                        PointCloudPoint point = stream->ConvertPoint(
+                            static_cast<float>(x), static_cast<float>(y), static_cast<float>(z),
+                            intensity, static_cast<float>(rangeM));
                         stream->GetLoadedPacketPoints().push_back(point);
                         totalPoints++;
                     }
                 }
                 
-                if (scanCount % 10 == 0 || scanCount == 1) {
+                if (Engine::Editors::CameraSystem::IsOusterVerbose() && (scanCount % 10 == 0 || scanCount == 1)) {
                     LOG_INFO_FMT("OusterFileLoader", "Scan %zu: %zu points", scanCount, totalPoints);
                 }
             }
         }
         
-        LOG_INFO_FMT("OusterFileLoader", "PCAP loaded: %zu scans, %zu points", scanCount, totalPoints);
+        LOG_INFO_FMT("OusterFileLoader", "Ouster: PCAP loaded with SDK: %zu scans, %zu points", scanCount, totalPoints);
         
         if (stream->GetLoadedPacketPoints().empty()) {
             LOG_WARNING("OusterFileLoader", "No points extracted");
@@ -285,12 +329,14 @@ bool LoadPcapFromFile(OusterStream* stream, const std::string& pcapFile, const s
         return true;
         
     } catch (const std::exception& e) {
-        LOG_ERROR_FMT("OusterFileLoader", "SDK error: %s", e.what());
-        LOG_WARNING("OusterFileLoader", "Falling back to manual parsing");
+        if (Engine::Editors::CameraSystem::IsOusterVerbose()) {
+            LOG_ERROR_FMT("OusterFileLoader", "SDK error: %s", e.what());
+        }
+        LOG_INFO("OusterFileLoader", "Ouster: falling back to manual PCAP parsing");
         return LoadPcapFromFileManual(stream, pcapFile, metadataFile);
     }
 #else
-    LOG_WARNING("OusterFileLoader", "SDK not available, using manual parsing");
+    LOG_INFO("OusterFileLoader", "Ouster: loading PCAP with manual parsing (SDK not available)");
     return LoadPcapFromFileManual(stream, pcapFile, metadataFile);
 #endif
 #else
@@ -308,7 +354,7 @@ bool LoadPacketFromFile(OusterStream* stream, const std::string& filename) {
         LOG_ERROR("OusterFileLoader", "Stream is null");
         return false;
     }
-    
+    stream->ClearFileLoadedState();
 #ifdef __APPLE__
     LOG_INFO_FMT("OusterFileLoader", "Loading packet: %s", filename.c_str());
     

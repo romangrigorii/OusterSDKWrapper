@@ -18,6 +18,9 @@ namespace OusterFileLoader {
 // Load metadata from JSON file (for SDK initialization)
 bool LoadMetadataFromFile(OusterStream* stream, const std::string& metadataFile);
 
+// Load metadata from JSON string (e.g. fetched from sensor HTTP API). Creates SDK XYZ LUT when OUSTER_SDK_AVAILABLE.
+bool LoadMetadataFromJsonString(OusterStream* stream, const std::string& metadataJson);
+
 // Load and parse a PCAP file with metadata JSON
 bool LoadPcapFromFile(OusterStream* stream, const std::string& pcapFile, const std::string& metadataFile);
 

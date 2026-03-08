@@ -7,11 +7,21 @@
 // ============================================================================
 
 #include "OusterStream.h"
+#include "OusterLogging.h"
 #include "platform/Logger.h"
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <vector>
 #include <algorithm>
+
+#ifdef OUSTER_SDK_AVAILABLE
+#include "ouster/xyzlut.h"
+#include "ouster/typedefs.h"
+#include <Eigen/Core>
+
+using namespace ouster::sdk::core;
+#endif
 
 // Ouster UDP packets use big-endian; convert to host for little-endian (e.g. Windows)
 namespace {
@@ -49,8 +59,8 @@ namespace CameraSystem {
 
 #pragma pack(push, 1)
 
-// LEGACY UDP profile: 16-byte column header, then pixel data (12 bytes per pixel). No extra block header.
-// Column advancement = 16 + beamCount*12 (footer not included so we match actual UDP payload size).
+// LEGACY UDP profile: 16-byte column header, pixel data (12 bytes per pixel), then 4-byte column footer (SDK col_footer_size).
+// Column advancement = 16 + beamCount*12 + 4 per SDK parsing.cpp.
 // Column header for LEGACY UDP profile (16 bytes)
 struct LidarColumnHeader {
     uint64_t timestamp;
@@ -78,12 +88,58 @@ static int g_debugCount = 0;
 
 static bool shouldLogPacket() {
     g_packetCount++;
-    return (g_packetCount <= 5 || g_packetCount % 100 == 0);
+    return Engine::Editors::CameraSystem::IsOusterVerbose() && (g_packetCount <= 5 || g_packetCount % 100 == 0);
 }
 
 static bool shouldLogDebug() {
-    return (++g_debugCount < 50);
+    return Engine::Editors::CameraSystem::IsOusterVerbose() && (++g_debugCount < 50);
 }
+
+#ifdef OUSTER_SDK_AVAILABLE
+// Build m_currentFrame from manual range/signal images using SDK XYZLut (same math as SDK path).
+static void BuildCurrentFrameFromRangeImage(OusterStream* stream) {
+    std::vector<uint32_t>& rangeBuf = stream->GetManualRangeImage();
+    std::vector<uint16_t>& signalBuf = stream->GetManualSignalImage();
+    const int w = stream->GetColumnsPerFrame();
+    const int h = stream->GetBeamCount();
+    const size_t expectedSize = static_cast<size_t>(w) * static_cast<size_t>(h);
+    if (rangeBuf.size() != expectedSize) return;
+
+    std::shared_ptr<void> rawLut = stream->GetXyzLutPtr();
+    auto xyzlutPtr = std::static_pointer_cast<XYZLut>(rawLut);
+    if (!xyzlutPtr) return;
+
+    // SDK xyzlut uses i = row*w+col (row-major). We fill rangeBuf with idx = beam*w+col.
+    // img_t in Ouster SDK is RowMajor; use it so range.data()[i] matches LUT order.
+    Eigen::Map<const img_t<uint32_t>> rangeMap(rangeBuf.data(), h, w);
+    PointCloudXYZd xyz = (*xyzlutPtr)(rangeMap);
+
+    const OusterConfig& config = stream->GetConfig();
+    std::vector<PointCloudPoint>& frame = stream->GetCurrentFrame();
+    frame.clear();
+    frame.reserve(expectedSize / 4u);
+
+    for (int col = 0; col < w; col++) {
+        for (int row = 0; row < h; row++) {
+            const size_t idx = static_cast<size_t>(row) * static_cast<size_t>(w) + static_cast<size_t>(col);
+            const uint32_t rangeCounts = rangeBuf[idx];
+            if (rangeCounts == 0) continue;
+            const double rangeM = static_cast<double>(rangeCounts) * 0.001;
+            if (rangeM < static_cast<double>(config.minRange) || rangeM > static_cast<double>(config.maxRange)) continue;
+            if (config.downsampleFactor > 1 && (row * w + col) % config.downsampleFactor != 0) continue;
+
+            const double x = xyz(idx, 0), y = xyz(idx, 1), z = xyz(idx, 2);
+            if (std::isnan(x) || std::isnan(y) || std::isnan(z)) continue;
+
+            const float intensity = (idx < signalBuf.size())
+                ? std::max(static_cast<float>(signalBuf[idx]) / 65535.0f, 0.1f) : 0.0f;
+            frame.push_back(stream->ConvertPoint(
+                static_cast<float>(x), static_cast<float>(y), static_cast<float>(z),
+                intensity, static_cast<float>(rangeM)));
+        }
+    }
+}
+#endif
 
 // ============================================================================
 // ProcessLidarPacketManual - Main packet parsing for live streaming
@@ -97,7 +153,9 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
     const size_t blockHdrSize = static_cast<size_t>(stream->GetMeasurementBlockHeaderSize());
     const size_t pixelStride = static_cast<size_t>(stream->GetPixelStride());
     const size_t columnDataSize = static_cast<size_t>(stream->GetBeamCount()) * pixelStride;
-    const size_t columnSize = columnHeaderSize + blockHdrSize + columnDataSize;
+    // LEGACY: 4-byte column footer per SDK (col_footer_size); non-LEGACY uses 0
+    const size_t columnFooterSize = (pixelStride == 12u && blockHdrSize == 0u) ? 4u : 0u;
+    const size_t columnSize = columnHeaderSize + blockHdrSize + columnDataSize + columnFooterSize;
     
     // Get beam angles
     std::vector<float>& beamAltitudeAngles = stream->GetBeamAltitudeAngles();
@@ -115,20 +173,49 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
     }
     
     if (size < columnSize) return;
+
+#ifdef OUSTER_SDK_AVAILABLE
+    const bool useXyzLut = (stream->GetXyzLutPtr() != nullptr);
+#else
+    const bool useXyzLut = false;
+#endif
+
+    // One-time path log: SDK XYZ LUT vs manual beam-angle
+    {
+        static std::atomic<int> g_pathLogged{0};
+        if (g_pathLogged++ == 0) {
+            if (useXyzLut)
+                LOG_INFO("OusterStream", "Ouster: using SDK XYZ LUT path (manual packets)");
+            else
+                LOG_INFO("OusterStream", "Ouster: using manual beam-angle path (no SDK LUT)");
+        }
+    }
+
+    // One scan = one full rotation = exactly ExpectedPacketsPerScan() packets (e.g. 64 for 1024 cols / 16 per packet).
+    // Do NOT flush on frame_id change: some sensors increment frame_id more often (e.g. every 16 packets), which would
+    // produce 4 partial scans (4 rotated overlays). Only flush when we have a full set of packets for one 360° scan.
+    if (useXyzLut && stream->GetPacketsInCurrentScan() == 0) {
+        stream->ClearManualRangeImage();
+    }
     
     size_t offset = 0;
     int totalColumns = 0;
     int totalPointsProcessed = 0;
     const OusterConfig& config = stream->GetConfig();
+    const int w = stream->GetColumnsPerFrame();
     
     while (offset + columnSize <= size && totalColumns < stream->GetColumnsPerPacket()) {
         const uint8_t* colBase = data + offset;
-        const LidarColumnHeader* header = reinterpret_cast<const LidarColumnHeader*>(colBase);
-        // Column header is big-endian from sensor; convert to host for correct frame/column ordering
-        uint64_t timestamp = be64_to_host(header->timestamp);
-        uint16_t measurementId = be16_to_host(header->measurementId);
-        uint16_t frameId = be16_to_host(header->frameId);
-        uint32_t encoderCount = be32_to_host(header->encoderCount) % static_cast<uint32_t>(stream->GetEncoderTicksPerRev());
+        // Ouster UDP packet format: LITTLE ENDIAN (per sensor docs "Words are 32 bits, little endian")
+        uint64_t timestamp = static_cast<uint64_t>(colBase[0]) | (static_cast<uint64_t>(colBase[1]) << 8)
+            | (static_cast<uint64_t>(colBase[2]) << 16) | (static_cast<uint64_t>(colBase[3]) << 24)
+            | (static_cast<uint64_t>(colBase[4]) << 32) | (static_cast<uint64_t>(colBase[5]) << 40)
+            | (static_cast<uint64_t>(colBase[6]) << 48) | (static_cast<uint64_t>(colBase[7]) << 56);
+        uint16_t measurementId = static_cast<uint16_t>(colBase[8]) | (static_cast<uint16_t>(colBase[9]) << 8);
+        uint16_t frameId = static_cast<uint16_t>(colBase[10]) | (static_cast<uint16_t>(colBase[11]) << 8);
+        uint32_t encoderCount = static_cast<uint32_t>(colBase[12]) | (static_cast<uint32_t>(colBase[13]) << 8)
+            | (static_cast<uint32_t>(colBase[14]) << 16) | (static_cast<uint32_t>(colBase[15]) << 24);
+        encoderCount %= static_cast<uint32_t>(stream->GetEncoderTicksPerRev());
         
         if (timestamp == 0) {
             offset += columnSize;
@@ -143,74 +230,91 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
                         totalColumns, (unsigned long long)timestamp, measurementId, frameId, encoderCount);
         }
         
-        // Frame boundary detection
-        if (!stream->IsFileLoadFrameStarted() || frameId != stream->GetFileLoadFrameId()) {
-            // New frame - flush previous
-            if (stream->IsFileLoadFrameStarted() && !stream->GetCurrentFrame().empty()) {
-                stream->FlushCurrentFrame(stream->GetFileLoadLastTimestamp(), 
-                                         stream->GetFileLoadMinEncoder(), 
-                                         stream->GetFileLoadMaxEncoder(), 
-                                         stream->IsFileLoadEncoderInitialized());
-            }
-            
-            stream->GetCurrentFrame().clear();
+        // Track frame_id/timestamp/encoder for flush stats (no flush on frame_id change;
+        // we flush only when we have a full scan = ExpectedPacketsPerScan() packets, like the SDK)
+        if (!stream->IsFileLoadFrameStarted() || stream->GetCurrentFrame().empty()) {
             stream->SetFileLoadFrameId(frameId);
             stream->SetFileLoadFrameStarted(true);
-            stream->SetFileLoadLastTimestamp(timestamp);
-            stream->GetLiveLastColumnTimestampNs().store(timestamp);
+        }
+        stream->SetFileLoadLastTimestamp(timestamp);
+        stream->GetLiveLastColumnTimestampNs().store(timestamp);
+        if (stream->IsFileLoadEncoderInitialized()) {
+            stream->SetFileLoadMinEncoder(std::min(stream->GetFileLoadMinEncoder(), encoderCount));
+            stream->SetFileLoadMaxEncoder(std::max(stream->GetFileLoadMaxEncoder(), encoderCount));
+        } else {
             stream->SetFileLoadMinEncoder(encoderCount);
             stream->SetFileLoadMaxEncoder(encoderCount);
             stream->SetFileLoadEncoderInitialized(true);
-        } else {
-            stream->SetFileLoadLastTimestamp(timestamp);
-            stream->GetLiveLastColumnTimestampNs().store(timestamp);
-            
-            if (stream->IsFileLoadEncoderInitialized()) {
-                stream->SetFileLoadMinEncoder(std::min(stream->GetFileLoadMinEncoder(), encoderCount));
-                stream->SetFileLoadMaxEncoder(std::max(stream->GetFileLoadMaxEncoder(), encoderCount));
-            } else {
-                stream->SetFileLoadMinEncoder(encoderCount);
-                stream->SetFileLoadMaxEncoder(encoderCount);
-                stream->SetFileLoadEncoderInitialized(true);
-            }
         }
         
-        // Process pixels
+        // Process pixels (pixel data ends before column footer)
         const uint8_t* pxBase = colBase + columnHeaderSize + blockHdrSize;
-        const uint8_t* colEnd = colBase + columnSize;
+        const uint8_t* pixelEnd = colBase + columnHeaderSize + blockHdrSize + columnDataSize;
         
-        for (int beam = 0; beam < stream->GetBeamCount(); beam += config.downsampleFactor) {
-            const uint8_t* p = pxBase + beam * pixelStride;
-            
-            if (p + pixelStride > colEnd) break;
-            
-            uint32_t range_counts;
-            uint16_t signal;
-            std::memcpy(&range_counts, p + 0, sizeof(uint32_t));
-            std::memcpy(&signal, p + 4, sizeof(uint16_t));
-            range_counts = be32_to_host(range_counts) & 0xFFFFFu;  // LEGACY: range is 20 bits
-            signal = be16_to_host(signal);
-            
-            float range = static_cast<float>(range_counts) * stream->GetRangeUnit();
-            
-            if (range <= 0.0f || range < config.minRange || range > config.maxRange) {
-                continue;
+        if (useXyzLut) {
+            // LEGACY pixel: 12 bytes, little-endian. RANGE bits 0-19, SIGNAL bits 48-63 (SDK LEGACY_FIELD_INFO)
+            for (int beam = 0; beam < stream->GetBeamCount(); beam++) {
+                const uint8_t* p = pxBase + beam * pixelStride;
+                if (p + pixelStride > pixelEnd) break;
+                uint32_t range_counts = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
+                    | ((static_cast<uint32_t>(p[2]) & 0x0Fu) << 16);  // 20 bits LE
+                uint16_t signal = static_cast<uint16_t>(p[6]) | (static_cast<uint16_t>(p[7]) << 8);  // bytes 6-7 LE
+                const int col = std::min(std::max(static_cast<int>(measurementId), 0), w - 1);
+                const size_t idx = static_cast<size_t>(beam) * static_cast<size_t>(w) + static_cast<size_t>(col);
+                if (idx < stream->GetManualRangeImage().size()) {
+                    stream->GetManualRangeImage()[idx] = range_counts;
+                    if (idx < stream->GetManualSignalImage().size())
+                        stream->GetManualSignalImage()[idx] = signal;
+                }
+                totalPointsProcessed++;
             }
-            
-            totalPointsProcessed++;
-            stream->GetCurrentFrame().push_back(
-                stream->CalculatePoint3D(measurementId, beam, range, signal, beamAltitudeAngles, beamAzimuthAngles)
-            );
+        } else {
+            for (int beam = 0; beam < stream->GetBeamCount(); beam += config.downsampleFactor) {
+                const uint8_t* p = pxBase + beam * pixelStride;
+                if (p + pixelStride > pixelEnd) break;
+                uint32_t range_counts = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
+                    | ((static_cast<uint32_t>(p[2]) & 0x0Fu) << 16);  // 20 bits LE
+                uint16_t signal = static_cast<uint16_t>(p[6]) | (static_cast<uint16_t>(p[7]) << 8);
+                float range = static_cast<float>(range_counts) * stream->GetRangeUnit();
+                if (range <= 0.0f || range < config.minRange || range > config.maxRange) continue;
+                totalPointsProcessed++;
+                stream->GetCurrentFrame().push_back(
+                    stream->CalculatePoint3D(measurementId, beam, range, signal, beamAltitudeAngles, beamAzimuthAngles)
+                );
+            }
         }
         
         offset += columnSize;
     }
     
+    // Flush only when we have a complete 360° scan (ExpectedPacketsPerScan() packets). Never flush on frame_id
+    // change, to avoid outputting multiple partial scans that appear as rotated overlays.
+    stream->AddPacketsInCurrentScan(1);
+    if (stream->GetPacketsInCurrentScan() >= stream->ExpectedPacketsPerScan()) {
+#ifdef OUSTER_SDK_AVAILABLE
+        if (useXyzLut) {
+            BuildCurrentFrameFromRangeImage(stream);
+        }
+#endif
+        stream->FlushCurrentFrame(stream->GetFileLoadLastTimestamp(),
+                                 stream->GetFileLoadMinEncoder(),
+                                 stream->GetFileLoadMaxEncoder(),
+                                 stream->IsFileLoadEncoderInitialized());
+        stream->ResetPacketsInCurrentScan();
+        // Refresh range image buffer for the next scan so we don't carry over previous scan data
+#ifdef OUSTER_SDK_AVAILABLE
+        if (useXyzLut) {
+            stream->ClearManualRangeImage();
+        }
+#endif
+    }
+    
     // Log stats periodically
     if (shouldLogPacket()) {
-        LOG_INFO_FMT("OusterStream", "Packet %d: %d columns, %d points, frame %u (%zu pts accumulated)", 
+        LOG_INFO_FMT("OusterStream", "Packet %d: %d columns, %d points, frame %u (%zu pts, %d/%d packets)", 
                      g_packetCount, totalColumns, totalPointsProcessed, 
-                     stream->GetFileLoadFrameId(), stream->GetCurrentFrame().size());
+                     stream->GetFileLoadFrameId(), stream->GetCurrentFrame().size(),
+                     stream->GetPacketsInCurrentScan(), stream->ExpectedPacketsPerScan());
     }
 }
 
@@ -226,13 +330,16 @@ void ProcessLidarPacketFromFileManual(OusterStream* stream, const uint8_t* data,
     const size_t blockHdrSize = static_cast<size_t>(stream->GetMeasurementBlockHeaderSize());
     const size_t pixelStride = static_cast<size_t>(stream->GetPixelStride());
     const size_t columnDataSize = static_cast<size_t>(stream->GetBeamCount()) * pixelStride;
-    const size_t columnSize = columnHeaderSize + blockHdrSize + columnDataSize;
+    const size_t columnFooterSize = (pixelStride == 12u && blockHdrSize == 0u) ? 4u : 0u;
+    const size_t columnSize = columnHeaderSize + blockHdrSize + columnDataSize + columnFooterSize;
     
-    static bool configLogged = false;
-    if (!configLogged) {
-        LOG_INFO_FMT("OusterStream", "Packet processing config: beamCount=%d, pixelStride=%zu, columnsPerPacket=%d", 
-                     stream->GetBeamCount(), pixelStride, stream->GetColumnsPerPacket());
-        configLogged = true;
+    if (Engine::Editors::CameraSystem::IsOusterVerbose()) {
+        static bool configLogged = false;
+        if (!configLogged) {
+            LOG_INFO_FMT("OusterStream", "Packet processing config: beamCount=%d, pixelStride=%zu, columnsPerPacket=%d",
+                         stream->GetBeamCount(), pixelStride, stream->GetColumnsPerPacket());
+            configLogged = true;
+        }
     }
     
     std::vector<float>& beamAltitudeAngles = stream->GetBeamAltitudeAngles();
@@ -250,17 +357,35 @@ void ProcessLidarPacketFromFileManual(OusterStream* stream, const uint8_t* data,
     
     if (size < columnSize) return;
     
+#ifdef OUSTER_SDK_AVAILABLE
+    const bool useXyzLut = (stream->GetXyzLutPtr() != nullptr);
+#else
+    const bool useXyzLut = false;
+#endif
+    const int w = stream->GetColumnsPerFrame();
+    
+    // One scan = ExpectedPacketsPerScan() packets. Do NOT flush on frame_id (sensor often increments every 16 packets = 4 overlays).
+    if (stream->GetPacketsInCurrentScan() == 0) {
+        if (useXyzLut) stream->ClearManualRangeImage();
+        else stream->GetCurrentFrame().clear();
+    }
+    
     size_t offset = 0;
     int totalColumns = 0;
     const OusterConfig& config = stream->GetConfig();
     
     while (offset + columnSize <= size && totalColumns < stream->GetColumnsPerPacket()) {
         const uint8_t* colBase = data + offset;
-        const LidarColumnHeader* header = reinterpret_cast<const LidarColumnHeader*>(colBase);
-        uint64_t timestamp = be64_to_host(header->timestamp);
-        uint16_t measurementId = be16_to_host(header->measurementId);
-        uint16_t frameId = be16_to_host(header->frameId);
-        uint32_t encoderCount = be32_to_host(header->encoderCount) % static_cast<uint32_t>(stream->GetEncoderTicksPerRev());
+        // Ouster packet: LITTLE ENDIAN
+        uint64_t timestamp = static_cast<uint64_t>(colBase[0]) | (static_cast<uint64_t>(colBase[1]) << 8)
+            | (static_cast<uint64_t>(colBase[2]) << 16) | (static_cast<uint64_t>(colBase[3]) << 24)
+            | (static_cast<uint64_t>(colBase[4]) << 32) | (static_cast<uint64_t>(colBase[5]) << 40)
+            | (static_cast<uint64_t>(colBase[6]) << 48) | (static_cast<uint64_t>(colBase[7]) << 56);
+        uint16_t measurementId = static_cast<uint16_t>(colBase[8]) | (static_cast<uint16_t>(colBase[9]) << 8);
+        uint16_t frameId = static_cast<uint16_t>(colBase[10]) | (static_cast<uint16_t>(colBase[11]) << 8);
+        uint32_t encoderCount = static_cast<uint32_t>(colBase[12]) | (static_cast<uint32_t>(colBase[13]) << 8)
+            | (static_cast<uint32_t>(colBase[14]) << 16) | (static_cast<uint32_t>(colBase[15]) << 24);
+        encoderCount %= static_cast<uint32_t>(stream->GetEncoderTicksPerRev());
         
         if (timestamp == 0) {
             offset += columnSize;
@@ -268,62 +393,69 @@ void ProcessLidarPacketFromFileManual(OusterStream* stream, const uint8_t* data,
         }
         
         totalColumns++;
-        
-        // Frame boundary detection
-        if (!stream->IsFileLoadFrameStarted() || frameId != stream->GetFileLoadFrameId()) {
-            if (stream->IsFileLoadFrameStarted() && !stream->GetCurrentFrame().empty()) {
-                stream->GetLoadedPacketPoints().insert(
-                    stream->GetLoadedPacketPoints().end(),
-                    stream->GetCurrentFrame().begin(), 
-                    stream->GetCurrentFrame().end()
-                );
-                LOG_INFO_FMT("OusterStream", "Frame %d complete: %zu points (total: %zu)", 
-                            stream->GetFileLoadFrameId(), stream->GetCurrentFrame().size(), 
-                            stream->GetLoadedPacketPoints().size());
-            }
-            
-            stream->GetCurrentFrame().clear();
+        stream->SetFileLoadLastTimestamp(timestamp);
+        if (!stream->IsFileLoadFrameStarted()) {
             stream->SetFileLoadFrameId(frameId);
             stream->SetFileLoadFrameStarted(true);
-            stream->SetFileLoadLastTimestamp(timestamp);
+        }
+        if (stream->IsFileLoadEncoderInitialized()) {
+            stream->SetFileLoadMinEncoder(std::min(stream->GetFileLoadMinEncoder(), encoderCount));
+            stream->SetFileLoadMaxEncoder(std::max(stream->GetFileLoadMaxEncoder(), encoderCount));
+        } else {
             stream->SetFileLoadMinEncoder(encoderCount);
             stream->SetFileLoadMaxEncoder(encoderCount);
             stream->SetFileLoadEncoderInitialized(true);
-        } else {
-            stream->SetFileLoadLastTimestamp(timestamp);
-            if (stream->IsFileLoadEncoderInitialized()) {
-                stream->SetFileLoadMinEncoder(std::min(stream->GetFileLoadMinEncoder(), encoderCount));
-                stream->SetFileLoadMaxEncoder(std::max(stream->GetFileLoadMaxEncoder(), encoderCount));
-            }
         }
         
-        // Process pixels
         const uint8_t* pxBase = colBase + columnHeaderSize + blockHdrSize;
-        const uint8_t* colEnd = colBase + columnSize;
+        const uint8_t* pixelEnd = colBase + columnHeaderSize + blockHdrSize + columnDataSize;
         
-        for (int beam = 0; beam < stream->GetBeamCount(); beam += config.downsampleFactor) {
-            const uint8_t* p = pxBase + beam * pixelStride;
-            if (p + pixelStride > colEnd) break;
-            
-            uint32_t range_counts;
-            uint16_t signal;
-            std::memcpy(&range_counts, p + 0, sizeof(uint32_t));
-            std::memcpy(&signal, p + 4, sizeof(uint16_t));
-            range_counts = be32_to_host(range_counts) & 0xFFFFFu;  // LEGACY: range is 20 bits
-            signal = be16_to_host(signal);
-            
-            float range = static_cast<float>(range_counts) * stream->GetRangeUnit();
-            
-            if (range <= 0.0f || range < config.minRange || range > config.maxRange) {
-                continue;
+        if (useXyzLut) {
+            for (int beam = 0; beam < stream->GetBeamCount(); beam++) {
+                const uint8_t* p = pxBase + beam * pixelStride;
+                if (p + pixelStride > pixelEnd) break;
+                uint32_t range_counts = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
+                    | ((static_cast<uint32_t>(p[2]) & 0x0Fu) << 16);
+                uint16_t signal = static_cast<uint16_t>(p[6]) | (static_cast<uint16_t>(p[7]) << 8);
+                const int col = std::min(std::max(static_cast<int>(measurementId), 0), w - 1);
+                const size_t idx = static_cast<size_t>(beam) * static_cast<size_t>(w) + static_cast<size_t>(col);
+                if (idx < stream->GetManualRangeImage().size()) {
+                    stream->GetManualRangeImage()[idx] = range_counts;
+                    if (idx < stream->GetManualSignalImage().size())
+                        stream->GetManualSignalImage()[idx] = signal;
+                }
             }
-            
-            stream->GetCurrentFrame().push_back(
-                stream->CalculatePoint3D(measurementId, beam, range, signal, beamAltitudeAngles, beamAzimuthAngles)
-            );
+        } else {
+            for (int beam = 0; beam < stream->GetBeamCount(); beam += config.downsampleFactor) {
+                const uint8_t* p = pxBase + beam * pixelStride;
+                if (p + pixelStride > pixelEnd) break;
+                uint32_t range_counts = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8)
+                    | ((static_cast<uint32_t>(p[2]) & 0x0Fu) << 16);
+                uint16_t signal = static_cast<uint16_t>(p[6]) | (static_cast<uint16_t>(p[7]) << 8);
+                float range = static_cast<float>(range_counts) * stream->GetRangeUnit();
+                if (range <= 0.0f || range < config.minRange || range > config.maxRange) continue;
+                stream->GetCurrentFrame().push_back(
+                    stream->CalculatePoint3D(measurementId, beam, range, signal, beamAltitudeAngles, beamAzimuthAngles)
+                );
+            }
         }
         
         offset += columnSize;
+    }
+    
+    // Flush only when we have a full 360° scan (ExpectedPacketsPerScan() packets), not on frame_id
+    stream->AddPacketsInCurrentScan(1);
+    if (stream->GetPacketsInCurrentScan() >= stream->ExpectedPacketsPerScan()) {
+#ifdef OUSTER_SDK_AVAILABLE
+        if (useXyzLut) BuildCurrentFrameFromRangeImage(stream);
+#endif
+        if (!stream->GetCurrentFrame().empty()) {
+            // Replace (don't append) so we display only this scan - avoids overlaying many scans
+            stream->GetLoadedPacketPoints() = stream->GetCurrentFrame();
+        }
+        stream->ResetPacketsInCurrentScan();
+        if (useXyzLut) stream->ClearManualRangeImage();
+        else stream->GetCurrentFrame().clear();
     }
 }
 
@@ -332,11 +464,11 @@ void ProcessLidarPacketFromFileManual(OusterStream* stream, const uint8_t* data,
 // ============================================================================
 
 bool LoadPcapFromFileManual(OusterStream* stream, const std::string& pcapFile, const std::string& metadataFile) {
-    // This function is kept for backward compatibility but SDK is preferred
-    LOG_WARNING("OusterStream", "LoadPcapFromFileManual is deprecated - SDK parsing is recommended");
-    
 #ifdef __APPLE__
-    LOG_INFO_FMT("OusterStream", "Loading PCAP manually: %s", pcapFile.c_str());
+    if (Engine::Editors::CameraSystem::IsOusterVerbose()) {
+        LOG_INFO_FMT("OusterStream", "Loading PCAP manually: %s", pcapFile.c_str());
+        LOG_WARNING("OusterStream", "LoadPcapFromFileManual: SDK parsing is recommended when available");
+    }
     
     FILE* pcapFileHandle = fopen(pcapFile.c_str(), "rb");
     if (!pcapFileHandle) {
@@ -380,6 +512,7 @@ bool LoadPcapFromFileManual(OusterStream* stream, const std::string& pcapFile, c
     stream->SetFileLoadFrameId(0);
     stream->SetFileLoadFrameStarted(false);
     stream->GetCurrentFrame().clear();
+    stream->ResetPacketsInCurrentScan();
     
     int packetCount = 0;
     int lidarPacketCount = 0;
@@ -442,13 +575,14 @@ bool LoadPcapFromFileManual(OusterStream* stream, const std::string& pcapFile, c
     
     fclose(pcapFileHandle);
     
-    // Flush final frame
-    if (stream->IsFileLoadFrameStarted() && !stream->GetCurrentFrame().empty()) {
-        stream->GetLoadedPacketPoints().insert(
-            stream->GetLoadedPacketPoints().end(),
-            stream->GetCurrentFrame().begin(),
-            stream->GetCurrentFrame().end()
-        );
+    // Flush any remaining partial scan
+#ifdef OUSTER_SDK_AVAILABLE
+    if (stream->GetXyzLutPtr() != nullptr && stream->GetPacketsInCurrentScan() > 0) {
+        BuildCurrentFrameFromRangeImage(stream);
+    }
+#endif
+    if (!stream->GetCurrentFrame().empty()) {
+        stream->GetLoadedPacketPoints() = stream->GetCurrentFrame();
     }
     
     LOG_INFO_FMT("OusterStream", "PCAP loaded: %d packets, %d lidar, %zu points", 
