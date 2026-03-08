@@ -8,6 +8,20 @@
 #include "OusterStreamCommon.h"
 #include "platform/Logger.h"
 #include <filesystem>
+#include <string>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <cerrno>
+#endif
 
 // Ouster C++ SDK includes (if available)
 #ifdef OUSTER_SDK_AVAILABLE
@@ -48,9 +62,30 @@ namespace OusterLiveStreaming {
 
 static bool CheckSensorConnectivity(const std::string& hostname) {
     char cmd[256];
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "curl -s --max-time 10 http://%s/api/v1/sensor/metadata/sensor_info > NUL 2>&1", hostname.c_str());
+#else
     snprintf(cmd, sizeof(cmd), "curl -s --max-time 10 http://%s/api/v1/sensor/metadata/sensor_info > /dev/null 2>&1", hostname.c_str());
+#endif
     return (system(cmd) == 0);
 }
+
+#ifdef _WIN32
+static std::string GetSocketErrorString() {
+    DWORD e = ::WSAGetLastError();
+    char buf[256];
+    if (::FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, e, 0, buf, (DWORD)sizeof(buf), NULL)) {
+        std::string s(buf);
+        while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+        return s;
+    }
+    return "WSAError " + std::to_string((unsigned long)e);
+}
+#else
+static std::string GetSocketErrorString() {
+    return strerror(errno);
+}
+#endif
 
 static bool EnsurePortsFree(int lidarPort, int imuPort) {
     bool lidarFree = OusterUtilities::KillProcessesOnPort(lidarPort);
@@ -103,10 +138,11 @@ static void ProcessScanToPointCloud(OusterStream* stream, const LidarScan& scan,
             }
             
             PointCloudPoint point;
+            // Use meters to match Python/SDK (xyzlut returns meters; browser viewer uses meters)
             point.position = glm::vec3(
-                static_cast<float>(x * 100.0),
-                static_cast<float>(y * 100.0),
-                static_cast<float>(z * 100.0)
+                static_cast<float>(x),
+                static_cast<float>(y),
+                static_cast<float>(z)
             );
             point.color = stream->MapToColor(intensity, static_cast<float>(rangeM));
             point.cameraId = config.cameraId;
@@ -307,12 +343,30 @@ void StreamingThreadImpl(OusterStream* stream) {
     
     const OusterConfig& config = stream->GetConfig();
     
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32) || defined(__linux__)
     try {
+#ifdef _WIN32
+        static bool wsaStarted = false;
+        if (!wsaStarted) {
+            WSADATA wsa;
+            if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+                LOG_ERROR("OusterLiveStreaming", "WSAStartup failed");
+                stream->SetStreaming(false);
+                return;
+            }
+            wsaStarted = true;
+        }
+#endif
         LOG_INFO("OusterLiveStreaming", "StreamingThread started");
 
         // Check if we should use bridge/hybrid mode or direct SDK mode
         bool useBridgeMode = config.useBridge;
+#ifdef _WIN32
+        if (useBridgeMode) {
+            LOG_WARNING("OusterLiveStreaming", "Bridge mode not supported on Windows - using Direct UDP");
+            useBridgeMode = false;
+        }
+#endif
 
 #ifdef OUSTER_SDK_AVAILABLE
 #if OUSTER_SENSOR_AVAILABLE
@@ -435,8 +489,9 @@ void StreamingThreadImpl(OusterStream* stream) {
 #endif  // OUSTER_SENSOR_AVAILABLE
 #endif  // OUSTER_SDK_AVAILABLE
 
-        // Bridge/Hybrid mode: Unix socket to Python bridge + SDK parsing
-        if (config.useBridge) {
+        // Bridge/Hybrid mode: Unix socket to Python bridge + SDK parsing (Unix only)
+#ifndef _WIN32
+        if (useBridgeMode) {
             LOG_INFO("OusterLiveStreaming", "Bridge mode - connecting to Python bridge");
             LOG_INFO_FMT("OusterLiveStreaming", "Run: python3 udp_bridge.py --src-ip %s --src-port %d",
                          config.localIp.c_str(), config.lidarPort);
@@ -576,28 +631,40 @@ void StreamingThreadImpl(OusterStream* stream) {
             stream->SetStreaming(false);
             return;
         }
+#endif  // !_WIN32
         
         // Direct UDP mode (may not work on macOS due to firewall)
         LOG_INFO("OusterLiveStreaming", "Direct UDP mode");
         
-        int sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock < 0) {
-            LOG_ERROR_FMT("OusterLiveStreaming", "Socket create failed: %s", strerror(errno));
+#ifdef _WIN32
+        SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock == INVALID_SOCKET) {
+            LOG_ERROR_FMT("OusterLiveStreaming", "Socket create failed: %s", GetSocketErrorString().c_str());
             stream->SetStreaming(false);
             return;
         }
+#else
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) {
+            LOG_ERROR_FMT("OusterLiveStreaming", "Socket create failed: %s", GetSocketErrorString().c_str());
+            stream->SetStreaming(false);
+            return;
+        }
+#endif
         
         int reuse = 1;
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+#ifndef _WIN32
         setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
         
         int bufSize = 4 * 1024 * 1024;
-        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufSize, sizeof(bufSize));
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufSize, sizeof(bufSize));
         
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(config.lidarPort);
+        addr.sin_port = htons(static_cast<u_short>(config.lidarPort));
         
         if (!config.localIp.empty()) {
             inet_pton(AF_INET, config.localIp.c_str(), &addr.sin_addr);
@@ -606,8 +673,12 @@ void StreamingThreadImpl(OusterStream* stream) {
         }
         
         if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            LOG_ERROR_FMT("OusterLiveStreaming", "Bind failed on port %d: %s", config.lidarPort, strerror(errno));
+            LOG_ERROR_FMT("OusterLiveStreaming", "Bind failed on port %d: %s", config.lidarPort, GetSocketErrorString().c_str());
+#ifdef _WIN32
+            closesocket(sock);
+#else
             close(sock);
+#endif
             stream->SetStreaming(false);
             return;
         }
@@ -616,23 +687,43 @@ void StreamingThreadImpl(OusterStream* stream) {
                      config.localIp.empty() ? "0.0.0.0" : config.localIp.c_str(), config.lidarPort);
         
         std::vector<uint8_t> buffer(65536);
-        struct pollfd pfd = {sock, POLLIN, 0};
-        
+        // Drain socket until empty each iteration so we get complete frames (~64 packets/frame)
+        // and don't mix packets from different frames or drop due to buffer buildup
+#ifdef _WIN32
+        WSAPOLLFD pfd = {};
+        pfd.fd = sock;
+        pfd.events = POLLIN;
         while (!stream->ShouldStop()) {
-            int ret = poll(&pfd, 1, 100);
-            if (ret <= 0 || !(pfd.revents & POLLIN)) continue;
-            
-            struct sockaddr_in sender;
-            socklen_t senderLen = sizeof(sender);
-            ssize_t n = recvfrom(sock, buffer.data(), buffer.size(), 0, 
-                                 (struct sockaddr*)&sender, &senderLen);
-            
-            if (n > 0) {
-                ProcessLidarPacketManual(stream, buffer.data(), static_cast<size_t>(n));
+            int drainCap = 2000;
+            while (drainCap-- > 0) {
+                int ret = WSAPoll(&pfd, 1, 0);
+                if (ret <= 0 || !(pfd.revents & POLLIN)) break;
+                struct sockaddr_in sender;
+                int senderLen = sizeof(sender);
+                int n = recvfrom(sock, (char*)buffer.data(), (int)buffer.size(), 0, (struct sockaddr*)&sender, &senderLen);
+                if (n > 0)
+                    ProcessLidarPacketManual(stream, buffer.data(), static_cast<size_t>(n));
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        
+        closesocket(sock);
+#else
+        struct pollfd pfd = {sock, POLLIN, 0};
+        while (!stream->ShouldStop()) {
+            int drainCap = 2000;
+            while (drainCap-- > 0) {
+                int ret = poll(&pfd, 1, 0);
+                if (ret <= 0 || !(pfd.revents & POLLIN)) break;
+                struct sockaddr_in sender;
+                socklen_t senderLen = sizeof(sender);
+                ssize_t n = recvfrom(sock, buffer.data(), buffer.size(), 0, (struct sockaddr*)&sender, &senderLen);
+                if (n > 0)
+                    ProcessLidarPacketManual(stream, buffer.data(), static_cast<size_t>(n));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
         close(sock);
+#endif
         stream->SetStreaming(false);
         return;
         
@@ -646,9 +737,9 @@ void StreamingThreadImpl(OusterStream* stream) {
         return;
     }
 #else
-    LOG_ERROR("OusterLiveStreaming", "Only macOS is currently supported");
+    LOG_ERROR("OusterLiveStreaming", "Live streaming not implemented for this platform");
     stream->SetStreaming(false);
-#endif  // __APPLE__
+#endif  // __APPLE__ || _WIN32 || __linux__
 }
 
 // ============================================================================

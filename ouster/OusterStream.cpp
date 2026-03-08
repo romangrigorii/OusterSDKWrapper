@@ -5,7 +5,13 @@
 #include "OusterStream.h"
 #include "OusterStreamCommon.h"
 #include "platform/Logger.h"
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
 #include <cmath>
+#if !defined(M_PI)
+#define M_PI 3.14159265358979323846
+#endif
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -71,7 +77,7 @@ OusterStream::OusterStream() {
     m_udpProfileLidar = "LEGACY";
     m_columnsPerPacket = 16;
     m_packetHeaderSize = 0;
-    m_measurementBlockHeaderSize = 4;
+    m_measurementBlockHeaderSize = 0;  // LEGACY: no block header; 4 bytes are column footer at end
     m_pixelStride = 12;
     m_encoderTicksPerRev = 90112;
     m_rangeUnit = 0.001f;
@@ -184,31 +190,39 @@ void OusterStream::ClearFileLoadedState() {
 PointCloudPoint OusterStream::CalculatePoint3D(uint16_t measurementId, int beam, float range, uint16_t signal,
                                                 const std::vector<float>& beamAltitudeAngles,
                                                 const std::vector<float>& beamAzimuthAngles) {
+    // Match SDK xyzlut: encoder from column, azimuth/altitude from beam angles (degrees -> radians)
     int columnIndex = static_cast<int>(measurementId);
-    int shift = (!m_pixelShiftByRow.empty() && beam < static_cast<int>(m_pixelShiftByRow.size())) 
+    int shift = (!m_pixelShiftByRow.empty() && beam < static_cast<int>(m_pixelShiftByRow.size()))
                 ? m_pixelShiftByRow[beam] : 0;
     int correctedColumn = (columnIndex + shift + m_columnsPerFrame) % m_columnsPerFrame;
-    
-    float theta_encoder = 2.0f * M_PI * (1.0f - static_cast<float>(correctedColumn) / static_cast<float>(m_columnsPerFrame));
-    float theta_azimuth = -2.0f * M_PI * (beamAzimuthAngles[beam] / 360.0f);
-    float phi = 2.0f * M_PI * (beamAltitudeAngles[beam] / 360.0f);
-    
-    // Ouster coordinate formula
-    float n = m_lidarOriginToBeamOriginMm;
-    float r_mm = range * 1000.0f;
-    float x_lidar = (r_mm - n) * cosf(theta_encoder + theta_azimuth) * cosf(phi) + n * cosf(theta_encoder);
-    float y_lidar = (r_mm - n) * sinf(theta_encoder + theta_azimuth) * cosf(phi) + n * sinf(theta_encoder);
-    float z_lidar = (r_mm - n) * sinf(phi) + m_beamToLidarTransform[11];  // Z offset from transform
-    
-    // Apply lidar-to-sensor transform
+    float theta_encoder = 2.0f * static_cast<float>(M_PI) - (static_cast<float>(correctedColumn) * 2.0f * static_cast<float>(M_PI) / static_cast<float>(m_columnsPerFrame));
+    float theta_azimuth = -(beamAzimuthAngles[beam] * static_cast<float>(M_PI) / 180.0f);
+    float altitude_rad = beamAltitudeAngles[beam] * static_cast<float>(M_PI) / 180.0f;
+    // Unit direction (same as SDK direction columns before range_unit scale)
+    float dir_x = cosf(theta_encoder + theta_azimuth) * cosf(altitude_rad);
+    float dir_y = sinf(theta_encoder + theta_azimuth) * cosf(altitude_rad);
+    float dir_z = sinf(altitude_rad);
+    // Beam origin offset (SDK: beam_to_lidar (0,3) and (2,3) in mm, D = euclidean distance)
+    float Bx = m_beamToLidarTransform[3];
+    float Bz = m_beamToLidarTransform[11];
+    float D = sqrtf(Bx * Bx + Bz * Bz);
+    float off_x = cosf(theta_encoder) * Bx - dir_x * D;
+    float off_y = sinf(theta_encoder) * Bx - dir_y * D;
+    float off_z = -dir_z * D + Bz;
+    // point_lidar in mm = range_m * 1000 * direction + offset_mm (SDK uses range_counts * range_unit * dir + offset*range_unit -> meters)
+    float range_mm = range * 1000.0f;
+    float x_lidar = range_mm * dir_x + off_x;
+    float y_lidar = range_mm * dir_y + off_y;
+    float z_lidar = range_mm * dir_z + off_z;
+    // Apply lidar-to-sensor transform (lidar frame in mm)
     float x_sensor_mm = m_lidarToSensorTransform[0] * x_lidar + m_lidarToSensorTransform[1] * y_lidar + m_lidarToSensorTransform[2] * z_lidar + m_lidarToSensorTransform[3];
     float y_sensor_mm = m_lidarToSensorTransform[4] * x_lidar + m_lidarToSensorTransform[5] * y_lidar + m_lidarToSensorTransform[6] * z_lidar + m_lidarToSensorTransform[7];
     float z_sensor_mm = m_lidarToSensorTransform[8] * x_lidar + m_lidarToSensorTransform[9] * y_lidar + m_lidarToSensorTransform[10] * z_lidar + m_lidarToSensorTransform[11];
     
-    // Convert to decimeters
-    float x = x_sensor_mm * 0.1f;
-    float y = y_sensor_mm * 0.1f;
-    float z = z_sensor_mm * 0.1f;
+    // Output in meters to match Python/SDK (setup_ouster.py and xyzlut use meters; browser receives meters)
+    float x = x_sensor_mm / 1000.0f;
+    float y = y_sensor_mm / 1000.0f;
+    float z = z_sensor_mm / 1000.0f;
     
     float intensity = std::max(static_cast<float>(signal) / 65535.0f, 0.1f);
     
@@ -263,11 +277,20 @@ void OusterStream::FlushCurrentFrame(uint64_t lastTimestamp, uint32_t minEncoder
     
     {
         std::lock_guard<std::mutex> lock(m_pointCloudMutex);
-        if (m_pointCloudQueue.size() >= MAX_QUEUE_SIZE) {
-            m_pointCloudQueue.pop();
-            m_droppedFrames++;
+        if (m_config.enableAccumulation && m_config.accumulateFrames > 0) {
+            // Accumulate frames (like web view): append this frame, keep last N frames
+            m_accumulatedFrames.push_back(std::move(m_currentFrame));
+            while (m_accumulatedFrames.size() > static_cast<size_t>(m_config.accumulateFrames)) {
+                m_accumulatedFrames.pop_front();
+            }
+            m_accumulationDirty = true;
+        } else {
+            if (m_pointCloudQueue.size() >= MAX_QUEUE_SIZE) {
+                m_pointCloudQueue.pop();
+                m_droppedFrames++;
+            }
+            m_pointCloudQueue.push({m_currentFrame, timestamp});
         }
-        m_pointCloudQueue.push({m_currentFrame, timestamp});
     }
     
     m_currentFrame.clear();

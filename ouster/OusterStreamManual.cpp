@@ -13,6 +13,32 @@
 #include <vector>
 #include <algorithm>
 
+// Ouster UDP packets use big-endian; convert to host for little-endian (e.g. Windows)
+namespace {
+inline uint32_t be32_to_host(uint32_t x) {
+#if defined(_WIN32) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    return ((x & 0xFFU) << 24) | ((x & 0xFF00U) << 8) | ((x & 0xFF0000U) >> 8) | ((x & 0xFF000000U) >> 24);
+#else
+    return x;
+#endif
+}
+inline uint16_t be16_to_host(uint16_t x) {
+#if defined(_WIN32) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    return static_cast<uint16_t>(((x & 0xFFU) << 8) | ((x & 0xFF00U) >> 8));
+#else
+    return x;
+#endif
+}
+inline uint64_t be64_to_host(uint64_t x) {
+#if defined(_WIN32) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    return ((x & 0xFFULL) << 56) | ((x & 0xFF00ULL) << 40) | ((x & 0xFF0000ULL) << 24) | ((x & 0xFF000000ULL) << 8)
+         | ((x & 0xFF00000000ULL) >> 8) | ((x & 0xFF0000000000ULL) >> 24) | ((x & 0xFF000000000000ULL) >> 40) | ((x & 0xFF00000000000000ULL) >> 56);
+#else
+    return x;
+#endif
+}
+}
+
 namespace Engine {
 namespace Editors {
 namespace CameraSystem {
@@ -23,6 +49,8 @@ namespace CameraSystem {
 
 #pragma pack(push, 1)
 
+// LEGACY UDP profile: 16-byte column header, then pixel data (12 bytes per pixel). No extra block header.
+// Column advancement = 16 + beamCount*12 (footer not included so we match actual UDP payload size).
 // Column header for LEGACY UDP profile (16 bytes)
 struct LidarColumnHeader {
     uint64_t timestamp;
@@ -96,8 +124,13 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
     while (offset + columnSize <= size && totalColumns < stream->GetColumnsPerPacket()) {
         const uint8_t* colBase = data + offset;
         const LidarColumnHeader* header = reinterpret_cast<const LidarColumnHeader*>(colBase);
+        // Column header is big-endian from sensor; convert to host for correct frame/column ordering
+        uint64_t timestamp = be64_to_host(header->timestamp);
+        uint16_t measurementId = be16_to_host(header->measurementId);
+        uint16_t frameId = be16_to_host(header->frameId);
+        uint32_t encoderCount = be32_to_host(header->encoderCount) % static_cast<uint32_t>(stream->GetEncoderTicksPerRev());
         
-        if (header->timestamp == 0) {
+        if (timestamp == 0) {
             offset += columnSize;
             continue;
         }
@@ -107,14 +140,11 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
         // Log first few column headers for debugging
         if (shouldLogDebug()) {
             LOG_INFO_FMT("OusterStream", "Col %d: ts=%llu measId=%u frameId=%u encoder=%u", 
-                        totalColumns, header->timestamp, header->measurementId, header->frameId, header->encoderCount);
+                        totalColumns, (unsigned long long)timestamp, measurementId, frameId, encoderCount);
         }
         
-        uint16_t measurementId = header->measurementId;
-        uint32_t encoderCount = header->encoderCount % stream->GetEncoderTicksPerRev();
-        
         // Frame boundary detection
-        if (!stream->IsFileLoadFrameStarted() || header->frameId != stream->GetFileLoadFrameId()) {
+        if (!stream->IsFileLoadFrameStarted() || frameId != stream->GetFileLoadFrameId()) {
             // New frame - flush previous
             if (stream->IsFileLoadFrameStarted() && !stream->GetCurrentFrame().empty()) {
                 stream->FlushCurrentFrame(stream->GetFileLoadLastTimestamp(), 
@@ -124,16 +154,16 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
             }
             
             stream->GetCurrentFrame().clear();
-            stream->SetFileLoadFrameId(header->frameId);
+            stream->SetFileLoadFrameId(frameId);
             stream->SetFileLoadFrameStarted(true);
-            stream->SetFileLoadLastTimestamp(header->timestamp);
-            stream->GetLiveLastColumnTimestampNs().store(header->timestamp);
+            stream->SetFileLoadLastTimestamp(timestamp);
+            stream->GetLiveLastColumnTimestampNs().store(timestamp);
             stream->SetFileLoadMinEncoder(encoderCount);
             stream->SetFileLoadMaxEncoder(encoderCount);
             stream->SetFileLoadEncoderInitialized(true);
         } else {
-            stream->SetFileLoadLastTimestamp(header->timestamp);
-            stream->GetLiveLastColumnTimestampNs().store(header->timestamp);
+            stream->SetFileLoadLastTimestamp(timestamp);
+            stream->GetLiveLastColumnTimestampNs().store(timestamp);
             
             if (stream->IsFileLoadEncoderInitialized()) {
                 stream->SetFileLoadMinEncoder(std::min(stream->GetFileLoadMinEncoder(), encoderCount));
@@ -158,6 +188,8 @@ void ProcessLidarPacketManual(OusterStream* stream, const uint8_t* data, size_t 
             uint16_t signal;
             std::memcpy(&range_counts, p + 0, sizeof(uint32_t));
             std::memcpy(&signal, p + 4, sizeof(uint16_t));
+            range_counts = be32_to_host(range_counts) & 0xFFFFFu;  // LEGACY: range is 20 bits
+            signal = be16_to_host(signal);
             
             float range = static_cast<float>(range_counts) * stream->GetRangeUnit();
             
@@ -225,18 +257,20 @@ void ProcessLidarPacketFromFileManual(OusterStream* stream, const uint8_t* data,
     while (offset + columnSize <= size && totalColumns < stream->GetColumnsPerPacket()) {
         const uint8_t* colBase = data + offset;
         const LidarColumnHeader* header = reinterpret_cast<const LidarColumnHeader*>(colBase);
+        uint64_t timestamp = be64_to_host(header->timestamp);
+        uint16_t measurementId = be16_to_host(header->measurementId);
+        uint16_t frameId = be16_to_host(header->frameId);
+        uint32_t encoderCount = be32_to_host(header->encoderCount) % static_cast<uint32_t>(stream->GetEncoderTicksPerRev());
         
-        if (header->timestamp == 0) {
+        if (timestamp == 0) {
             offset += columnSize;
             continue;
         }
         
         totalColumns++;
-        uint16_t measurementId = header->measurementId;
-        uint32_t encoderCount = header->encoderCount % stream->GetEncoderTicksPerRev();
         
         // Frame boundary detection
-        if (!stream->IsFileLoadFrameStarted() || header->frameId != stream->GetFileLoadFrameId()) {
+        if (!stream->IsFileLoadFrameStarted() || frameId != stream->GetFileLoadFrameId()) {
             if (stream->IsFileLoadFrameStarted() && !stream->GetCurrentFrame().empty()) {
                 stream->GetLoadedPacketPoints().insert(
                     stream->GetLoadedPacketPoints().end(),
@@ -249,14 +283,14 @@ void ProcessLidarPacketFromFileManual(OusterStream* stream, const uint8_t* data,
             }
             
             stream->GetCurrentFrame().clear();
-            stream->SetFileLoadFrameId(header->frameId);
+            stream->SetFileLoadFrameId(frameId);
             stream->SetFileLoadFrameStarted(true);
-            stream->SetFileLoadLastTimestamp(header->timestamp);
+            stream->SetFileLoadLastTimestamp(timestamp);
             stream->SetFileLoadMinEncoder(encoderCount);
             stream->SetFileLoadMaxEncoder(encoderCount);
             stream->SetFileLoadEncoderInitialized(true);
         } else {
-            stream->SetFileLoadLastTimestamp(header->timestamp);
+            stream->SetFileLoadLastTimestamp(timestamp);
             if (stream->IsFileLoadEncoderInitialized()) {
                 stream->SetFileLoadMinEncoder(std::min(stream->GetFileLoadMinEncoder(), encoderCount));
                 stream->SetFileLoadMaxEncoder(std::max(stream->GetFileLoadMaxEncoder(), encoderCount));
@@ -275,6 +309,8 @@ void ProcessLidarPacketFromFileManual(OusterStream* stream, const uint8_t* data,
             uint16_t signal;
             std::memcpy(&range_counts, p + 0, sizeof(uint32_t));
             std::memcpy(&signal, p + 4, sizeof(uint16_t));
+            range_counts = be32_to_host(range_counts) & 0xFFFFFu;  // LEGACY: range is 20 bits
+            signal = be16_to_host(signal);
             
             float range = static_cast<float>(range_counts) * stream->GetRangeUnit();
             

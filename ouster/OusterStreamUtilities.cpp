@@ -4,7 +4,14 @@
 
 #include "OusterStreamUtilities.h"
 #include "platform/Logger.h"
+#ifdef _WIN32
+#include <windows.h>
+using pid_t = DWORD;
+static inline pid_t ouster_getpid() { return static_cast<pid_t>(GetCurrentProcessId()); }
+#else
 #include <unistd.h>
+#define ouster_getpid getpid
+#endif
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -17,10 +24,14 @@ namespace CameraSystem {
 namespace OusterUtilities {
 
 bool KillProcessesOnPort(int port) {
-    pid_t current_pid = getpid();
+    pid_t current_pid = ouster_getpid();
     bool ports_freed = false;
-    
-#ifdef __APPLE__
+
+#ifdef _WIN32
+    (void)port;
+    (void)current_pid;
+    ports_freed = true;  // No port-kill implementation on Windows; assume port is free
+#elif defined(__APPLE__)
     char cmd[512];
     snprintf(cmd, sizeof(cmd), 
         "for pid in $(lsof -ti :%d 2>/dev/null); do if [ \"$pid\" != \"%d\" ]; then kill -9 $pid 2>/dev/null; fi; done", 

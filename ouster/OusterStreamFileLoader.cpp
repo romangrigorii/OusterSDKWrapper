@@ -254,10 +254,11 @@ bool LoadPcapFromFile(OusterStream* stream, const std::string& pcapFile, const s
                         }
                         
                         PointCloudPoint point;
+                        // Use meters to match Python/SDK (xyzlut returns meters)
                         point.position = glm::vec3(
-                            static_cast<float>(x * 100.0),
-                            static_cast<float>(y * 100.0),
-                            static_cast<float>(z * 100.0)
+                            static_cast<float>(x),
+                            static_cast<float>(y),
+                            static_cast<float>(z)
                         );
                         point.cameraId = config.cameraId;
                         point.color = stream->MapToColor(static_cast<float>(signal), static_cast<float>(rangeM));
@@ -517,7 +518,7 @@ bool ParseMetadataFileImpl(OusterStream* stream, const std::string& metadataFile
         
         if (profile == "LEGACY") {
             stream->SetPixelStride(12);
-            stream->SetMeasurementBlockHeaderSize(4);
+            stream->SetMeasurementBlockHeaderSize(0);  // LEGACY: 4 bytes are column footer, not block header
         } else if (profile == "RNG19_RFL8_SIG16_NIR16") {
             stream->SetPixelStride(8);
             stream->SetMeasurementBlockHeaderSize(4);
