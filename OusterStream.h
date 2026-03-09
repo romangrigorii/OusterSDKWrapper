@@ -4,7 +4,7 @@
 // OusterStream.h - Main Ouster LiDAR streaming class
 // ============================================================================
 
-#include "../remesh/Remeshing.h"  // For PointCloudPoint
+#include "remesh/Remeshing.h"  // For PointCloudPoint
 #include <glm/glm.hpp>
 #include <vector>
 #include <string>
