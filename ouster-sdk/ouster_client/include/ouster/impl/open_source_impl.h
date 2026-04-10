@@ -14,6 +14,12 @@
 #include "ouster/io_type.h"
 #include "ouster/scan_source_utils.h"
 
+// Windows headers (e.g. wingdi.h) define REGISTERED as a macro; it breaks the
+// static member REGISTERED below when this header is included after Win32 headers.
+#ifdef REGISTERED
+#undef REGISTERED
+#endif
+
 namespace ouster {
 namespace sdk {
 

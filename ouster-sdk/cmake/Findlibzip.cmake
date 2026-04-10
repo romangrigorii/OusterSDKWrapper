@@ -17,6 +17,10 @@ endmacro()
 if(VCPKG_TOOLCHAIN)
   libzip_internal_find_package()
 endif()
+if(libzip_FOUND OR TARGET libzip::zip)
+  set(libzip_FOUND TRUE)
+  return()
+endif()
 
 # Try to find with pkg-config first because the cmakelists is often bad for libzip
 find_package(PkgConfig QUIET)
@@ -30,6 +34,13 @@ endif()
 # Otherwise fall back to find_package
 if(NOT pkg_libzip_FOUND)
   libzip_internal_find_package()
+endif()
+
+# find_package(CONFIG) provides libzip::zip on Windows/vcpkg; the manual find_library() below only
+# lists Unix .so names. Macro return() does not stop this file — bail out if CONFIG worked.
+if(libzip_FOUND OR TARGET libzip::zip)
+  set(libzip_FOUND TRUE)
+  return()
 endif()
 
 find_path(libzip_INCLUDE_DIRS

@@ -16,9 +16,16 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <Windows.h>
+// Winsock must be included before Windows.h to avoid ws2tcpip.h / winsock macro conflicts.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <Windows.h>
 #else
 // clang-format off
 #include <dirent.h>

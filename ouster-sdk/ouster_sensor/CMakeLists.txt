@@ -19,6 +19,10 @@ target_link_libraries(ouster_sensor
     $<BUILD_INTERFACE:CURL::libcurl>
     )
 target_compile_definitions(ouster_sensor PRIVATE EIGEN_MPL2_ONLY)
+if(MSVC)
+  # Avoid Windows min/max macros breaking std::min/std::max (client.cpp, STL, jsoncons, etc.)
+  target_compile_definitions(ouster_sensor PRIVATE NOMINMAX _USE_MATH_DEFINES)
+endif()
 if(BUILD_SHARED_LIBRARY)
   target_compile_definitions(ouster_sensor PRIVATE BUILD_SHARED_LIBS_EXPORT)
 endif()

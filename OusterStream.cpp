@@ -6,6 +6,11 @@
 #include "OusterStreamCommon.h"
 #include "OusterLogging.h"
 #include "platform/Logger.h"
+#if defined(_WIN32)
+// Avoid collisions between Windows headers (CHAR/UINT32) and Ouster SDK deprecated chanfield enums.
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#endif
 #ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
 #endif
@@ -20,7 +25,6 @@
 
 // Ouster C++ SDK includes (if available)
 #ifdef OUSTER_SDK_AVAILABLE
-#include "ouster/pcap_scan_source.h"
 #include "ouster/lidar_scan.h"
 #include "ouster/xyzlut.h"
 #include "ouster/cartesian.h"
@@ -28,13 +32,16 @@
 #include "ouster/types.h"
 
 using namespace ouster::sdk;
-using namespace ouster::sdk::core;
-using namespace ouster::sdk::pcap;
+namespace ouster_core = ouster::sdk::core;
+#if !defined(_WIN32)
+#include "ouster/pcap_scan_source.h"
+namespace ouster_pcap = ouster::sdk::pcap;
+#endif
 
 #ifdef BUILD_SENSOR
 #include "ouster/sensor_scan_source.h"
 #include "ouster/sensor_packet_source.h"
-using namespace ouster::sdk::sensor;
+namespace ouster_sensor = ouster::sdk::sensor;
 #define OUSTER_SENSOR_AVAILABLE 1
 #else
 #define OUSTER_SENSOR_AVAILABLE 0

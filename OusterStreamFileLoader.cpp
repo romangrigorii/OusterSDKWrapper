@@ -20,7 +20,6 @@
 
 // Ouster C++ SDK includes (if available)
 #ifdef OUSTER_SDK_AVAILABLE
-#include "ouster/pcap_scan_source.h"
 #include "ouster/lidar_scan.h"
 #include "ouster/xyzlut.h"
 #include "ouster/cartesian.h"
@@ -28,8 +27,11 @@
 #include "ouster/types.h"
 
 using namespace ouster::sdk;
-using namespace ouster::sdk::core;
-using namespace ouster::sdk::pcap;
+namespace ouster_core = ouster::sdk::core;
+#if !defined(_WIN32)
+#include "ouster/pcap_scan_source.h"
+namespace ouster_pcap = ouster::sdk::pcap;
+#endif
 #endif
 
 namespace Engine {
@@ -114,14 +116,14 @@ bool LoadMetadataFromFile(OusterStream* stream, const std::string& metadataFile)
             return false;
         }
         
-        SensorInfo sensorInfoObj(metadataJson);
-        stream->GetSensorInfo() = std::make_shared<SensorInfo>(sensorInfoObj);
+        ouster_core::SensorInfo sensorInfoObj(metadataJson);
+        stream->GetSensorInfo() = std::make_shared<ouster_core::SensorInfo>(sensorInfoObj);
         
         LOG_INFO_FMT("OusterFileLoader", "Loaded: %s (SN: %llu)", 
                     stream->GetSensorInfo()->prod_line.c_str(), 
                     static_cast<unsigned long long>(stream->GetSensorInfo()->sn));
         
-        auto xyzlut = std::make_shared<XYZLut>(*stream->GetSensorInfo(), false);
+        auto xyzlut = std::make_shared<ouster_core::XYZLut>(*stream->GetSensorInfo(), false);
         stream->GetXyzLutPtr() = std::static_pointer_cast<void>(xyzlut);
         
         LOG_INFO("OusterFileLoader", "XYZ lookup table created");
@@ -164,12 +166,12 @@ bool LoadMetadataFromJsonString(OusterStream* stream, const std::string& metadat
     }
 #ifdef OUSTER_SDK_AVAILABLE
     try {
-        SensorInfo sensorInfoObj(metadataJson);
-        stream->GetSensorInfo() = std::make_shared<SensorInfo>(sensorInfoObj);
+        ouster_core::SensorInfo sensorInfoObj(metadataJson);
+        stream->GetSensorInfo() = std::make_shared<ouster_core::SensorInfo>(sensorInfoObj);
         LOG_INFO_FMT("OusterFileLoader", "Metadata from sensor: %s (SN: %llu)",
                     stream->GetSensorInfo()->prod_line.c_str(),
                     static_cast<unsigned long long>(stream->GetSensorInfo()->sn));
-        auto xyzlut = std::make_shared<XYZLut>(*stream->GetSensorInfo(), false);
+        auto xyzlut = std::make_shared<ouster_core::XYZLut>(*stream->GetSensorInfo(), false);
         stream->GetXyzLutPtr() = std::static_pointer_cast<void>(xyzlut);
         LOG_INFO("OusterFileLoader", "XYZ lookup table created from sensor metadata");
         return true;

@@ -49,6 +49,10 @@ target_link_libraries(ouster_client
     ${OPENSSL_LIBRARIES}
     )
 target_compile_definitions(ouster_client PRIVATE EIGEN_MPL2_ONLY)
+if(MSVC)
+  # MSVC does not define M_PI unless this is set (used in packet.cpp, normals.cpp, xyzlut.cpp, etc.)
+  target_compile_definitions(ouster_client PRIVATE _USE_MATH_DEFINES)
+endif()
 if(BUILD_SHARED_LIBRARY)
   target_compile_definitions(ouster_client PRIVATE BUILD_SHARED_LIBS_EXPORT)
 endif()
