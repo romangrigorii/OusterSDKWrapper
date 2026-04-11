@@ -239,6 +239,7 @@ PointCloudPoint OusterStream::ConvertPoint(float x, float y, float z, float inte
     point.position = glm::vec3(pos);
     point.color = MapToColor(intensity, range);
     point.weight = 1.0f;
+    point.sampleCount = 1;
     point.segmentId = -1;
     point.cameraId = m_config.cameraId;
     
