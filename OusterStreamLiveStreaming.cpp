@@ -212,9 +212,8 @@ bool Connect(OusterStream* stream) {
         return false;
     }
     
-    const OusterConfig& config = stream->GetConfig();
-    
 #ifdef __APPLE__
+    const OusterConfig& config = stream->GetConfig();
     LOG_INFO_FMT("OusterLiveStreaming", "Connecting to sensor at %s", config.hostname.c_str());
     
     // Configure sensor UDP destination

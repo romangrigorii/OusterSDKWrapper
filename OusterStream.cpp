@@ -237,6 +237,8 @@ PointCloudPoint OusterStream::ConvertPoint(float x, float y, float z, float inte
     glm::vec4 pos(x, y, z, 1.0f);
     pos = m_config.sensorToWorld * pos;
     point.position = glm::vec3(pos);
+    point.sensorOriginWorld = glm::vec3(m_config.sensorToWorld[3]);
+    point.measuredRangeM = glm::length(point.position - point.sensorOriginWorld);
     point.color = MapToColor(intensity, range);
     point.weight = 1.0f;
     point.sampleCount = 1;
