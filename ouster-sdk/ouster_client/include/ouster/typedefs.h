@@ -12,7 +12,7 @@ namespace core {
  * @tparam T The data type for the vector.
  */
 template <typename T>
-using Vector16 = Eigen::Vector<T, 16>;
+using Vector16 = Eigen::Matrix<T, 16, 1>;
 
 /**
  * @brief 3x3 matrix with row-major storage.
